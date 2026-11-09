@@ -206,7 +206,12 @@ def backup_dir(name):
 
 def load_manifest(d):
     with open(os.path.join(d, "manifest.json")) as f:
-        return json.load(f)
+        m = json.load(f)
+    # Older single-file backups (root.tar.zst instead of root.tar.zst.000, .001 …)
+    for fn, e in m.get("files", {}).items():
+        e.setdefault("parts", [fn])
+        e.setdefault("part_sha256", [e.get("sha256", "")])
+    return m
 
 
 def save_manifest(d, m):
