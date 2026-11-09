@@ -1,6 +1,6 @@
 # Pi Backup Manager
 
-**Version 1.2.2** · [Changelog](#changelog) · [Upgrade](#upgrade)
+**Version 1.3.0** · [Changelog](#changelog) · [Upgrade](#upgrade)
 
 A simple desktop app for **compressed, restorable whole-system backups** of a Raspberry Pi,
 with a **disk manager** for choosing where backups live and a **calendar scheduler** for
@@ -31,7 +31,11 @@ Works with an SD card, a USB or NVMe SSD, or two NVMe drives in a RAID1 mirror.
   Missed runs can catch up when the Pi next starts, and each scheduled backup can be checked
   automatically.
 - **Check** any backup. Every piece is read back and compared with its checksum.
-- **Get files back** into `~/Restored/<backup>/` without touching the live system.
+- **Browse a backup and pick what to get back:** a folder tree with checkboxes, search, sizes and
+  dates. Tick a folder, untick anything inside it you don't need, then restore the selection into
+  `~/Restored/<backup>/` without touching the live system.
+
+  ![Browse backup](screenshots/7-browse-backup.png)
 - **Rebuild a whole system** onto a drive:
   - *Single drive:* creates the standard Pi boot and system partitions, unpacks the backup and
     points the startup settings at the new drive. Use it to recover onto a new SD card or SSD,
@@ -122,8 +126,14 @@ journalctl -u pibackup-scheduled.service             # what happened
 
 ### A few files
 
-On the **Restore** tab, under *Get files or folders back*, pick a backup and enter one or more
-full paths (separated by `;`). Copies appear in `~/Restored/<backup>/…`.
+On the **Restore** tab, pick a backup and click **Browse backup…**. Tick the files and folders
+you want (search helps in big backups), then click **Restore selected**. Copies appear in
+`~/Restored/<backup>/…` with their original folders. You can also type full paths and use
+*Restore typed path(s)*.
+
+Every backup saves a list of its contents (`index.tsv.gz`), so browsing opens instantly. For
+backups made before version 1.3.0 the list is built the first time you browse, which reads the
+whole backup once.
 
 ### The whole system
 
@@ -171,6 +181,11 @@ sudo /opt/pibackup/pibackup-helper scan-services
 
 ## Good to know
 
+- **Scheduling uses a systemd timer, not cron.** The timer catches up missed runs, runs as root
+  without anyone logged in, and logs to the journal.
+- **Nothing opens at startup.** The window only appears when you launch the app. At boot the
+  backup drive is mounted (if connected) and the timer waits for the next scheduled time.
+
 - Backups are taken while the system runs. Files that change during the copy (logs, for
   example) are captured as they were at that moment. Pause database services for a clean
   copy.
@@ -191,6 +206,8 @@ Then remove the two Pi Backup Manager lines from `/etc/fstab`. Your backups stay
 
 ## Changelog
 
+- **1.3.0:** **Browse backup…** to look inside a backup and restore only the ticked files and
+  folders; each backup saves a contents list for instant browsing.
 - **1.2.2:** a 12/24-hour clock switch in the scheduler (remembered per user).
 - **1.2.1:** the scheduler uses a 12-hour clock with AM/PM.
 - **1.2.0:** the version is shown in the app; one-line install and upgrade (`upgrade.sh`).

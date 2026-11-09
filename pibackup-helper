@@ -10,6 +10,7 @@ systemd timer). Prints one status line at a time:
 """
 import argparse
 import fcntl
+import gzip
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
 FSTAB = os.environ.get("PIBACKUP_FSTAB", "/etc/fstab")
@@ -552,11 +553,13 @@ def feed_parts(paths, dest_stdin, p0, p1, label):
     return whole.hexdigest(), part_shas
 
 
-def tar_to_zstd(src, excludes, outbase, est, p0, p1, label, errlog):
+def tar_to_zstd(src, excludes, outbase, est, p0, p1, label, errlog, index_raw=None):
     tar = ["tar", "--create", "--file=-", "--directory", src, "--one-file-system",
            "--numeric-owner", "--acls", "--xattrs", "--xattrs-include=*", "--sparse",
            "--warning=no-file-changed", "--warning=no-file-removed",
            "--warning=no-file-ignored", "--warning=no-xdev", "--anchored"]
+    if index_raw:
+        tar += ["-vv", "--quoting-style=literal", f"--index-file={index_raw}"]
     tar += [f"--exclude={e}" for e in excludes] + ["."]
     zp = subprocess.Popen(["zstd", "-T0", "-3", "-q", "-c"],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
@@ -797,8 +800,14 @@ def cmd_backup(a):
                                                      100_000_000, 1, 3, "Boot partition", errlog)
         stopped = pause_services(opts.get("pause_services") or [])
         excl = EXCLUDES + exclude_patterns(a.source, opts.get("excludes") or [])
+        raw = os.path.join(work, ".index.raw")
         m["files"]["root.tar.zst"] = tar_to_zstd(a.source, excl, os.path.join(work, "root.tar.zst"),
-                                                 used, 3, 97, "System", errlog)
+                                                 used, 3, 96, "System", errlog, index_raw=raw)
+        resume_services(stopped)
+        stopped = []
+        progress(97, "Saving the list of files")
+        m["indexed_files"] = write_index(raw, os.path.join(work, INDEX))
+        os.remove(raw)
     except Cancelled:
         resume_services(stopped)
         shutil.rmtree(work, ignore_errors=True)
@@ -898,6 +907,91 @@ def cmd_verify(a):
     done_ok(f"Backup {a.name} checked: every file reads back correctly.")
 
 
+# ================================================================ contents index
+INDEX = "index.tsv.gz"
+
+
+def parse_tar_vv(line):
+    """'drwxr-xr-x 0/0  0 2026-11-09 15:26 ./etc/' -> (kind, size, mtime, path) or None."""
+    f = line.rstrip("\n").split(None, 5)
+    if len(f) < 6 or not f[5].startswith("./"):
+        return None
+    perms, _owner, size, date, tm, name = f
+    t = perms[0]
+    if t == "l" and " -> " in name:
+        name = name.split(" -> ", 1)[0]
+    elif t == "h" or " link to " in name:
+        name = name.split(" link to ", 1)[0]
+    kind = {"d": "d", "-": "f", "l": "l", "h": "f"}.get(t, "o")
+    name = name[2:].rstrip("/")
+    if not name:
+        return None
+    return kind, size if size.isdigit() else "0", f"{date} {tm}", name
+
+
+def write_index(raw_path, out_path):
+    n = 0
+    with open(raw_path, errors="replace") as src, gzip.open(out_path + ".tmp", "wt") as dst:
+        for line in src:
+            r = parse_tar_vv(line)
+            if r:
+                dst.write("\t".join(r) + "\n")
+                n += 1
+    os.replace(out_path + ".tmp", out_path)
+    try:
+        os.chmod(out_path, 0o600)
+    except OSError:
+        pass
+    return n
+
+
+def build_index_from_archive(d, m):
+    """For backups made before contents indexes existed: read the archive once and save an index."""
+    raw = os.path.join(d, ".index.raw")
+    zp = subprocess.Popen(["zstd", "-dc", "-q"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    with open(raw, "w") as rf:
+        tp = subprocess.Popen(["tar", "-tvv", "--quoting-style=literal", "-f", "-"], stdin=zp.stdout,
+                              stdout=rf, stderr=subprocess.DEVNULL)
+        zp.stdout.close()
+        try:
+            feed_parts(part_paths(d, m["files"]["root.tar.zst"]), zp.stdin, 0, 95, "Reading the backup's contents")
+        except Cancelled:
+            zp.kill()
+            tp.kill()
+            os.remove(raw)
+            raise
+        zp.wait()
+        tp.wait()
+    n = write_index(raw, os.path.join(d, INDEX))
+    os.remove(raw)
+    return n
+
+
+def cmd_index(a):
+    ensure_mounted()
+    d = backup_dir(a.name)
+    m = load_manifest(d)
+    path = os.path.join(d, INDEX)
+    if not os.path.isfile(path):
+        take_lock()
+        try:
+            log("This backup has no contents list yet; reading it once (later browsing is instant).")
+            build_index_from_archive(d, m)
+        except Cancelled:
+            fail("Cancelled.")
+        except Exception as e:
+            fail(f"Couldn't read the backup's contents: {e}")
+    uid = os.environ.get("PKEXEC_UID", "")
+    tdir = f"/run/user/{uid}" if uid.isdigit() and os.path.isdir(f"/run/user/{uid}") else tempfile.gettempdir()
+    dest = os.path.join(tdir, f"pibackup-index-{a.name}.tsv.gz")
+    shutil.copyfile(path, dest)
+    os.chmod(dest, 0o600)
+    if uid.isdigit():
+        os.chown(dest, int(uid), int(out(["id", "-g", uid]).strip() or uid))
+    emit("INDEX", dest)
+    done_ok("Contents ready.")
+
+
 # ================================================================ restore
 def extract(paths, dest, members, p0, p1, label, vfat=False):
     tar = ["tar", "-x", "-f", "-", "-C", dest]
@@ -906,7 +1000,20 @@ def extract(paths, dest, members, p0, p1, label, vfat=False):
     else:
         tar += ["--numeric-owner", "--same-owner", "-p", "--acls", "--xattrs",
                 "--xattrs-include=*", "--sparse"]
-    tar += members
+    listf = None
+    if members:
+        listf = tempfile.NamedTemporaryFile("w", delete=False, prefix="pibackup-members-")
+        listf.write("\n".join(members) + "\n")
+        listf.close()
+        tar += ["--verbatim-files-from", "-T", listf.name]
+    try:
+        _extract(paths, tar, p0, p1, label)
+    finally:
+        if listf:
+            os.remove(listf.name)
+
+
+def _extract(paths, tar, p0, p1, label):
     zp = subprocess.Popen(["zstd", "-dc", "-q"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     with tempfile.TemporaryFile() as ef:
         tp = subprocess.Popen(tar, stdin=zp.stdout, stderr=ef)
@@ -932,8 +1039,17 @@ def cmd_restore_files(a):
     ensure_mounted()
     d = backup_dir(a.name)
     m = load_manifest(d)
+    raw_paths = list(a.paths or [])
+    if a.paths_file:
+        try:
+            with open(a.paths_file) as f:
+                raw_paths += [ln.rstrip("\n") for ln in f if ln.strip()]
+        except OSError as e:
+            fail(f"Couldn't read the list of files: {e}")
+    if not raw_paths:
+        fail("Choose at least one file or folder.")
     members = []
-    for p in a.paths:
+    for p in raw_paths:
         p = os.path.normpath("/" + p.strip()).lstrip("/")
         if not p or p.startswith(".."):
             fail("Choose a folder or file inside the backup, not the whole system.")
@@ -956,7 +1072,7 @@ def cmd_restore_files(a):
         parent = os.path.dirname(dest)
         if os.path.basename(parent) == "Restored":
             os.chown(parent, int(uid), gid)
-    done_ok(f"Restored into {dest}")
+    done_ok(f"Restored {len(members)} item{'s' if len(members) != 1 else ''} into {dest}")
 
 
 def make_mountpoints(root):
@@ -1333,7 +1449,10 @@ def main():
     r = sub.add_parser("restore-files")
     r.add_argument("name")
     r.add_argument("--dest", required=True)
-    r.add_argument("paths", nargs="+")
+    r.add_argument("--paths-file", help="file with one path per line")
+    r.add_argument("paths", nargs="*")
+    ix = sub.add_parser("index", help="make the backup's contents list available to the GUI")
+    ix.add_argument("name")
     s = sub.add_parser("restore-system")
     s.add_argument("name")
     s.add_argument("--mode", choices=["standard", "raid"], default="standard")
@@ -1371,7 +1490,7 @@ def main():
          "restore-system": cmd_restore_system, "delete": cmd_delete, "mount": cmd_mount,
          "set-location": cmd_set_location, "format-location": cmd_format_location,
          "set-options": cmd_set_options, "set-schedule": cmd_set_schedule,
-         "scan-services": cmd_scan_services}[a.cmd](a)
+         "scan-services": cmd_scan_services, "index": cmd_index}[a.cmd](a)
     except SystemExit:
         raise
     except Exception as e:

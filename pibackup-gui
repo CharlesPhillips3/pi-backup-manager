@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Pi Backup Manager - compressed, restorable whole-system backups for Raspberry Pi."""
+import bisect
 import calendar as calmod
 import datetime as dt
+import gzip
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 
 import gi
@@ -14,7 +17,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
@@ -28,6 +31,16 @@ DATA_SVC = re.compile(r"influx|maria|mysql|postgres|mongo|redis|mosquitto|elasti
                       r"grafana|home-?assistant|nextcloud|docker|containerd|couch|minio|syncthing", re.I)
 OLLAMA_DIRS = ["/usr/share/ollama/.ollama/models", "/var/lib/ollama/models"]
 DEFAULT_OPTS = {"keep": 3, "pause_services": [], "excludes": []}
+
+
+def human(n):
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} KB"
+    return f"{n} bytes" if n else "—"
 
 
 def gb(n):
@@ -267,6 +280,222 @@ class MonthGrid(Gtk.Box):
             b.set_tooltip_text(", ".join(tip) or None)
 
 
+class BackupExplorer(Gtk.Dialog):
+    """Browse a backup's contents as a folder tree with checkboxes, then restore the selection."""
+    MAXHIT = 2000
+
+    def __init__(self, parent, index_path, name):
+        super().__init__(title=f"Browse backup {name}", transient_for=parent, modal=True)
+        self.set_default_size(880, 640)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.restore_btn = self.add_button("Restore selected to ~/Restored", Gtk.ResponseType.OK)
+        self.restore_btn.get_style_context().add_class("suggested-action")
+        self.restore_btn.set_sensitive(False)
+        rows = []
+        with gzip.open(index_path, "rt", errors="replace") as f:
+            for line in f:
+                r = line.rstrip("\n").split("\t", 3)
+                if len(r) == 4:
+                    rows.append(r)
+        rows.sort(key=lambda r: r[3])
+        self.paths = [r[3] for r in rows]
+        self.kinds = [r[0] for r in rows]
+        self.sizes = [int(r[1]) if r[1].isdigit() else 0 for r in rows]
+        self.dates = [r[2] for r in rows]
+        self.cum = [0]
+        for z in self.sizes:
+            self.cum.append(self.cum[-1] + z)
+        self.sel = set()
+        self.kids = {}
+
+        area = self.get_content_area()
+        area.set_spacing(6)
+        area.set_border_width(8)
+        top = Gtk.Box(spacing=8)
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Search file and folder names…")
+        self.search.set_hexpand(True)
+        self.search.connect("search-changed", self.on_search)
+        top.pack_start(self.search, True, True, 0)
+        clear = Gtk.Button(label="Clear selection")
+        clear.connect("clicked", lambda *_: (self.sel.clear(), self.refresh_marks()))
+        top.pack_start(clear, False, False, 0)
+        area.pack_start(top, False, False, 0)
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup("<small>Tick a folder to restore all of it, then untick anything inside you don't want. "
+                        f"{len(self.paths):,} items in this backup.</small>")
+        area.pack_start(hint, False, False, 0)
+
+        # checked, inconsistent, name, size, date, path, is_dir, icon
+        cols = (bool, bool, str, str, str, str, bool, str)
+        self.tree_model = Gtk.TreeStore(*cols)
+        self.list_model = Gtk.ListStore(*cols)
+        self.tv = Gtk.TreeView(model=self.tree_model)
+        tr = Gtk.CellRendererToggle()
+        tr.connect("toggled", self.on_toggled)
+        c = Gtk.TreeViewColumn("", tr, active=0, inconsistent=1)
+        self.tv.append_column(c)
+        c = Gtk.TreeViewColumn("Name")
+        ip = Gtk.CellRendererPixbuf()
+        c.pack_start(ip, False)
+        c.add_attribute(ip, "icon-name", 7)
+        tx = Gtk.CellRendererText()
+        tx.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        c.pack_start(tx, True)
+        c.add_attribute(tx, "text", 2)
+        c.set_expand(True)
+        c.set_resizable(True)
+        self.tv.append_column(c)
+        self.tv.set_expander_column(c)
+        for title, idx, w in (("Size", 3, 90), ("Modified", 4, 140)):
+            r = Gtk.CellRendererText()
+            col = Gtk.TreeViewColumn(title, r, text=idx)
+            col.set_min_width(w)
+            self.tv.append_column(col)
+        self.tv.connect("row-expanded", self.on_expanded)
+        self.tv.connect("row-activated", self.on_activated)
+        sw = Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        sw.add(self.tv)
+        area.pack_start(sw, True, True, 0)
+        self.status = Gtk.Label(xalign=0)
+        area.pack_start(self.status, False, False, 0)
+        self.add_rows(None, "")
+        self.update_status()
+        self.show_all()
+
+    # ---- index helpers
+    def span(self, prefix):
+        return bisect.bisect_left(self.paths, prefix), bisect.bisect_left(self.paths, prefix + "\U0010ffff")
+
+    def idx(self, p):
+        i = bisect.bisect_left(self.paths, p)
+        return i if i < len(self.paths) and self.paths[i] == p else None
+
+    def children(self, d):
+        if d not in self.kids:
+            prefix = d + "/" if d else ""
+            lo, hi = self.span(prefix)
+            n = len(prefix)
+            res = [i for i in range(lo, hi) if "/" not in self.paths[i][n:]]
+            res.sort(key=lambda i: (self.kinds[i] != "d", self.paths[i][n:].lower()))
+            self.kids[d] = res
+        return self.kids[d]
+
+    def subtree_size(self, p):
+        i = self.idx(p)
+        own = self.sizes[i] if i is not None else 0
+        if i is not None and self.kinds[i] != "d":
+            return own
+        lo, hi = self.span(p + "/")
+        return own + self.cum[hi] - self.cum[lo]
+
+    def row_for(self, i, label=None):
+        p = self.paths[i]
+        isdir = self.kinds[i] == "d"
+        icon = {"d": "folder", "l": "emblem-symbolic-link"}.get(self.kinds[i], "text-x-generic")
+        return [self.is_selected(p), self.partial(p), label or p.rsplit("/", 1)[-1],
+                human(self.subtree_size(p)), self.dates[i], p, isdir, icon]
+
+    def add_rows(self, parent, d):
+        for i in self.children(d):
+            it = self.tree_model.append(parent, self.row_for(i))
+            if self.kinds[i] == "d":
+                lo, hi = self.span(self.paths[i] + "/")
+                if hi > lo:
+                    self.tree_model.append(it, [False, False, "…", "", "", "", False, ""])
+
+    def on_expanded(self, tv, it, path):
+        child = self.tree_model.iter_children(it)
+        if child is not None and self.tree_model[child][5] == "":
+            # add the real rows first: removing the only child would collapse the row again
+            self.add_rows(it, self.tree_model[it][5])
+            self.tree_model.remove(child)
+
+    def on_activated(self, tv, path, col):
+        if tv.get_model() is self.tree_model:
+            tv.collapse_row(path) if tv.row_expanded(path) else tv.expand_row(path, False)
+
+    # ---- selection (a selected path means it and everything inside it)
+    def ancestors(self, p):
+        parts = p.split("/")
+        return ["/".join(parts[:k]) for k in range(1, len(parts))]
+
+    def is_selected(self, p):
+        return p in self.sel or any(a in self.sel for a in self.ancestors(p))
+
+    def partial(self, p):
+        if self.is_selected(p):
+            return False
+        pre = p + "/"
+        return any(x.startswith(pre) for x in self.sel)
+
+    def toggle(self, p):
+        if not p:
+            return
+        if self.is_selected(p):
+            if p in self.sel:
+                self.sel.discard(p)
+            else:
+                anc = next(a for a in self.ancestors(p) if a in self.sel)
+                self.sel.discard(anc)
+                cur = anc
+                while cur != p:
+                    nxt = p[:p.index("/", len(cur) + 1)] if "/" in p[len(cur) + 1:] else p
+                    for i in self.children(cur):
+                        if self.paths[i] != nxt:
+                            self.sel.add(self.paths[i])
+                    cur = nxt
+        else:
+            pre = p + "/"
+            self.sel = {x for x in self.sel if not x.startswith(pre)}
+            self.sel.add(p)
+        self.refresh_marks()
+
+    def on_toggled(self, renderer, path):
+        model = self.tv.get_model()
+        self.toggle(model[path][5])
+
+    def refresh_marks(self):
+        def upd(model, path, it, _):
+            p = model[it][5]
+            if p:
+                model[it][0] = self.is_selected(p)
+                model[it][1] = self.partial(p)
+            return False
+        self.tree_model.foreach(upd, None)
+        self.list_model.foreach(upd, None)
+        self.update_status()
+
+    def update_status(self):
+        n = len(self.sel)
+        size = sum(self.subtree_size(p) for p in self.sel)
+        self.status.set_markup(f"<b>{n}</b> item{'s' if n != 1 else ''} selected · {human(size)}" if n
+                               else "Nothing selected yet.")
+        self.restore_btn.set_sensitive(n > 0)
+
+    # ---- search
+    def on_search(self, entry):
+        q = entry.get_text().strip().lower()
+        if len(q) < 2:
+            self.tv.set_model(self.tree_model)
+            return
+        self.list_model.clear()
+        hits = 0
+        for i, p in enumerate(self.paths):
+            if q in p.rsplit("/", 1)[-1].lower():
+                self.list_model.append(self.row_for(i, label="/" + p))
+                hits += 1
+                if hits >= self.MAXHIT:
+                    break
+        self.tv.set_model(self.list_model)
+        if hits >= self.MAXHIT:
+            self.status.set_markup(f"Showing the first {self.MAXHIT} matches; type more to narrow it down.")
+
+    def selection(self):
+        return sorted(self.sel)
+
+
 # ---------------------------------------------------------------- window
 class App(Gtk.Window):
     def __init__(self):
@@ -279,6 +508,7 @@ class App(Gtk.Window):
         self.last_ok = False
         self.quiet_done = False
         self.scan_results = []
+        self.index_path = None
         self.prefs = load_prefs()
         self.use24 = bool(self.prefs.get("clock24", False))
         self.conf = read_conf()
@@ -326,7 +556,7 @@ class App(Gtk.Window):
         root.pack_start(row, False, False, 0)
 
         self.action_widgets = [self.backup_btn, self.verify_btn, self.delete_btn, self.mount_btn,
-                               self.files_btn, self.rebuild_btn, self.use_btn, self.format_btn,
+                               self.files_btn, self.browse_btn, self.rebuild_btn, self.use_btn, self.format_btn,
                                self.sched_save_btn, self.scan_btn]
         self.load_options_into_ui()
         self.load_schedule_into_ui()
@@ -798,9 +1028,16 @@ class App(Gtk.Window):
         note.set_markup("<small>Copies go into <b>~/Restored/&lt;backup&gt;/</b> with their original "
                         "folders. Nothing on your system is overwritten.</small>")
         g.attach(note, 0, 2, 2, 1)
-        self.files_btn = Gtk.Button(label="Restore to ~/Restored")
+        bb = Gtk.Box(spacing=8)
+        self.browse_btn = Gtk.Button(label="Browse backup…")
+        self.browse_btn.get_style_context().add_class("suggested-action")
+        self.browse_btn.set_tooltip_text("Look inside the backup and tick the files and folders to get back")
+        self.browse_btn.connect("clicked", self.on_browse)
+        self.files_btn = Gtk.Button(label="Restore typed path(s)")
         self.files_btn.connect("clicked", self.on_restore_files)
-        g.attach(self.files_btn, 1, 3, 1, 1)
+        bb.pack_start(self.browse_btn, True, True, 0)
+        bb.pack_start(self.files_btn, True, True, 0)
+        g.attach(bb, 1, 3, 1, 1)
         box.pack_start(f1, False, False, 0)
 
         f2 = Gtk.Frame(label=" Rebuild a whole system onto a drive ")
@@ -1220,6 +1457,47 @@ class App(Gtk.Window):
         self.after_job = lambda ok: ok and subprocess.Popen(["xdg-open", dest])
         self.run_job(["restore-files", n, "--dest", dest] + paths, "Restoring files…")
 
+    def on_browse(self, *_):
+        n = self.files_combo.get_active_id()
+        if not n:
+            self.message("Choose a backup first.")
+            return
+        self.index_path = None
+        self.quiet_done = True
+        self.after_job = lambda ok: ok and self.index_path and self.open_explorer(n)
+        self.run_job(["index", n], "Opening backup…")
+
+    def open_explorer(self, name):
+        try:
+            dlg = BackupExplorer(self, self.index_path, name)
+        except Exception as e:
+            self.message(f"Couldn't read the backup's contents: {e}", error=True)
+            return
+        resp = dlg.run()
+        chosen = dlg.selection()
+        dlg.destroy()
+        try:
+            os.remove(self.index_path)
+        except OSError:
+            pass
+        if resp != Gtk.ResponseType.OK or not chosen:
+            return
+        fd, listfile = tempfile.mkstemp(prefix="pibackup-select-", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(chosen) + "\n")
+        dest = os.path.join(os.path.expanduser("~"), "Restored", name)
+
+        def done(ok):
+            try:
+                os.remove(listfile)
+            except OSError:
+                pass
+            if ok:
+                subprocess.Popen(["xdg-open", dest])
+        self.after_job = done
+        self.run_job(["restore-files", name, "--dest", dest, "--paths-file", listfile],
+                     f"Restoring {len(chosen)} item{'s' if len(chosen) != 1 else ''}…")
+
     def on_rebuild(self, *_):
         n = self.sys_combo.get_active_id()
         mode = self.rmode_combo.get_active_id()
@@ -1281,6 +1559,8 @@ class App(Gtk.Window):
             self.bar.set_text(text)
         elif kind == "LOG":
             self.append_log(rest)
+        elif kind == "INDEX":
+            self.index_path = rest.strip()
         elif kind == "SCAN":
             try:
                 r = json.loads(rest)
