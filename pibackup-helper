@@ -1,0 +1,1249 @@
+#!/usr/bin/env python3
+"""
+pibackup-helper - privileged back end for Pi Backup Manager.
+
+Runs as root (the GUI starts it through pkexec; scheduled backups run it from a
+systemd timer). Prints one status line at a time:
+  PROGRESS <percent> <text>
+  LOG <text>
+  DONE ok|fail <message>
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
+CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
+FSTAB = os.environ.get("PIBACKUP_FSTAB", "/etc/fstab")
+STATE_DIR = os.environ.get("PIBACKUP_STATE", "/var/lib/pibackup")
+UNIT_DIR = os.environ.get("PIBACKUP_UNIT_DIR", "/etc/systemd/system")
+LOCK = os.environ.get("PIBACKUP_LOCK", "/run/pibackup.lock")
+APP_DIR = "/opt/pibackup"
+TARGET_MNT = "/mnt/pibackup-target"
+BOOT_MNT = "/mnt/pibackup-boot"
+CHUNK = 1 << 20
+PART_SIZE = int(os.environ.get("PIBACKUP_PART_SIZE", 3_900_000_000))  # fits FAT32's 4 GB limit
+NAME_RE = re.compile(r"^\d{4}-\d\d-\d\d_\d{4}$")
+SVC_RE = re.compile(r"^[A-Za-z0-9@._:-]+$")
+SUBDIR_RE = re.compile(r"^[A-Za-z0-9._ -]{0,64}$")
+SYSTEM_MOUNTS = {"/", "/boot", "/boot/firmware", "[SWAP]"}
+LINUX_FS = {"ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs"}
+OTHER_FS = {"vfat", "exfat", "ntfs"}
+FSTAB_TAG = "# Pi Backup Manager location (managed automatically)"
+TIMER = "pibackup-scheduled.timer"
+SERVICE = "pibackup-scheduled.service"
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+EXCLUDES = [
+    "./proc/*", "./sys/*", "./dev/*", "./run/*", "./tmp/*", "./var/tmp/*",
+    "./mnt/*", "./media/*", "./lost+found/*", "./swapfile", "./var/swap",
+    "./var/cache/apt/archives/*.deb", "./var/lib/systemd/coredump/*",
+    "./home/*/.cache/*", "./root/.cache/*", "./home/*/.local/share/Trash/*",
+]
+
+cancel = threading.Event()
+STORE = MNT
+BDIR = os.path.join(MNT, "backups")
+SCHEDULED = False
+
+
+class Cancelled(Exception):
+    pass
+
+
+# ================================================================ output
+def emit(kind, *parts):
+    print(kind, *parts, flush=True)
+
+
+def log(msg):
+    emit("LOG", msg)
+
+
+def progress(pct, text):
+    emit("PROGRESS", f"{max(0.0, min(100.0, pct)):.1f}", text)
+
+
+def record_last_run(ok, msg):
+    if not SCHEDULED:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "last-scheduled.json"), "w") as f:
+            json.dump({"ok": ok, "message": msg, "time": time.strftime("%Y-%m-%d %H:%M")}, f)
+        os.chmod(os.path.join(STATE_DIR, "last-scheduled.json"), 0o644)
+    except OSError:
+        pass
+
+
+def done_ok(msg):
+    record_last_run(True, msg)
+    emit("DONE", "ok", msg)
+    sys.exit(0)
+
+
+def fail(msg):
+    record_last_run(False, msg)
+    emit("DONE", "fail", msg)
+    sys.exit(1)
+
+
+def gb(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
+def run(cmd, check=True, **kw):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        if check:
+            raise RuntimeError(f"The program '{cmd[0]}' isn't installed (sudo apt install {cmd[0]}).")
+        return subprocess.CompletedProcess(cmd, 127, "", "")
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def out(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def blk(dev, key):
+    return out(["blkid", "-s", key, "-o", "value", dev]).strip() if dev else ""
+
+
+def take_lock():
+    try:
+        fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        fail("Another backup or restore is already running. Try again when it has finished.")
+    except OSError:
+        return None
+
+
+# ================================================================ config
+def read_conf():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_conf(c):
+    d = os.path.dirname(CONF)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(CONF + ".tmp", "w") as f:
+        json.dump(c, f, indent=2)
+    os.chmod(CONF + ".tmp", 0o644)
+    os.replace(CONF + ".tmp", CONF)
+
+
+def mount_type(fstype):
+    return "ntfs3" if fstype == "ntfs" else fstype
+
+
+def mount_opts(fstype, for_fstab):
+    o = ["noatime"]
+    if for_fstab:
+        o += ["nofail", "x-systemd.device-timeout=10s"]
+    if fstype in OTHER_FS:
+        o += ["uid=0", "gid=0", "fmask=0133", "dmask=0022"]
+    return ",".join(o)
+
+
+def ensure_mounted():
+    global STORE, BDIR
+    c = read_conf()
+    loc = c.get("location")
+    if not loc:
+        fail("No backup location is set yet. Open Pi Backup Manager → Backup location and choose a drive.")
+    STORE = os.path.join(MNT, loc["subdir"]) if loc.get("subdir") else MNT
+    BDIR = os.path.join(STORE, "backups")
+    if os.environ.get("PIBACKUP_NOMOUNT"):
+        os.makedirs(BDIR, exist_ok=True)
+        return c
+    if os.path.ismount(MNT):
+        src = out(["findmnt", "-no", "SOURCE", MNT]).strip().split("[")[0]
+        if blk(src, "UUID") == loc["uuid"]:
+            os.makedirs(BDIR, exist_ok=True)
+            return c
+        run(["umount", MNT], check=False)
+    dev = out(["blkid", "-U", loc["uuid"]]).strip()
+    if not dev:
+        fail(f"The backup drive ({loc.get('desc') or loc['uuid']}) isn't connected.")
+    os.makedirs(MNT, exist_ok=True)
+    run(["mount", "-t", mount_type(loc["fstype"]), "-o", mount_opts(loc["fstype"], False), dev, MNT])
+    os.makedirs(BDIR, exist_ok=True)
+    return c
+
+
+def backup_dir(name):
+    if not NAME_RE.match(name or ""):
+        fail(f"Not a valid backup name: {name!r}")
+    d = os.path.join(BDIR, name)
+    if not os.path.isfile(os.path.join(d, "manifest.json")):
+        fail(f"Backup {name} not found.")
+    return d
+
+
+def load_manifest(d):
+    with open(os.path.join(d, "manifest.json")) as f:
+        return json.load(f)
+
+
+def save_manifest(d, m):
+    p = os.path.join(d, "manifest.json")
+    with open(p + ".tmp", "w") as f:
+        json.dump(m, f, indent=2)
+    os.replace(p + ".tmp", p)
+    try:
+        os.chmod(p, 0o644)
+    except OSError:
+        pass
+
+
+def list_backups():
+    if not os.path.isdir(BDIR):
+        return []
+    return sorted(n for n in os.listdir(BDIR)
+                  if NAME_RE.match(n) and os.path.isfile(os.path.join(BDIR, n, "manifest.json")))
+
+
+def part_paths(d, entry):
+    return [os.path.join(d, p) for p in entry["parts"]]
+
+
+def watch_stdin():
+    def reader():
+        try:
+            while sys.stdin.read(4096):
+                pass
+        except Exception:
+            pass
+        cancel.set()
+    threading.Thread(target=reader, daemon=True).start()
+
+
+# ================================================================ block devices
+def lsblk_tree():
+    return json.loads(out(["lsblk", "-J", "-b", "-o",
+                           "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS"]) or '{"blockdevices":[]}')
+
+
+def walk(node):
+    yield node
+    for c in node.get("children") or []:
+        yield from walk(c)
+
+
+def find_dev(tree, path):
+    real = os.path.realpath(path)
+    for top in tree["blockdevices"]:
+        for n in walk(top):
+            if n.get("path") == real:
+                return n
+    return None
+
+
+def mounts_of(n):
+    return [p for p in (n.get("mountpoints") or []) if p]
+
+
+def partitions_of(disk):
+    """Make the kernel re-read the partition table, then list the partitions (waits up to 10 s)."""
+    run(["blockdev", "--rereadpt", disk], check=False)
+    run(["partx", "-a", disk], check=False)   # add partitions the kernel doesn't know yet
+    run(["partx", "-u", disk], check=False)   # update ones it does
+    parts = []
+    for _ in range(20):
+        run(["udevadm", "settle"], check=False)
+        parts = []
+        for line in out(["lsblk", "-lnpo", "NAME,TYPE", disk]).splitlines():
+            f = line.split()
+            if len(f) == 2 and f[1] == "part":
+                parts.append(f[0])
+        if parts and all(os.path.exists(p) for p in parts):
+            break
+        time.sleep(0.5)
+    return parts
+
+
+def check_erasable(tree, dev, allow_automount=True):
+    """Refuse anything holding the running system; unmount desktop automounts."""
+    n = find_dev(tree, dev)
+    if not n or n.get("type") not in ("disk", "part"):
+        raise RuntimeError(f"{dev} isn't a drive or partition.")
+    to_unmount = []
+    for c in walk(n):
+        if (c.get("type") or "").startswith("raid") or c.get("fstype") == "linux_raid_member":
+            raise RuntimeError(f"{dev} is part of a RAID array. Remove it from the array first.")
+        for mp in mounts_of(c):
+            if mp in SYSTEM_MOUNTS:
+                raise RuntimeError(f"{dev} holds your running system ({c['path']} at {mp}). "
+                                   "It can't be erased while the Pi is running from it.")
+            if allow_automount and (mp.startswith("/media/") or mp.startswith("/run/media/") or mp == MNT):
+                to_unmount.append(mp)
+            else:
+                raise RuntimeError(f"{c['path']} is in use at {mp}. Unmount it first.")
+    return n, to_unmount
+
+
+# ================================================================ location
+def update_fstab(loc):
+    try:
+        lines = open(FSTAB).read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    if not os.path.exists(FSTAB + ".pibackup-bak") and lines:
+        shutil.copy2(FSTAB, FSTAB + ".pibackup-bak")
+    keep = []
+    for line in lines:
+        f = line.split()
+        if line.strip() == FSTAB_TAG or (len(f) >= 2 and not line.lstrip().startswith("#") and f[1] == MNT):
+            continue
+        keep.append(line)
+    keep += [FSTAB_TAG,
+             f"UUID={loc['uuid']}  {MNT}  {mount_type(loc['fstype'])}  {mount_opts(loc['fstype'], True)}  0  0"]
+    with open(FSTAB + ".tmp", "w") as f:
+        f.write("\n".join(keep) + "\n")
+    os.chmod(FSTAB + ".tmp", 0o644)
+    os.replace(FSTAB + ".tmp", FSTAB)
+    run(["systemctl", "daemon-reload"], check=False)
+
+
+def copy_tools():
+    if not os.path.isdir(APP_DIR):
+        return
+    t = os.path.join(STORE, "tools")
+    os.makedirs(t, exist_ok=True)
+    for fn in ("pibackup-helper", "pibackup-gui", "install.sh", "README.md"):
+        src = os.path.join(APP_DIR, fn)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(t, fn))
+    if os.path.isfile(os.path.join(APP_DIR, "README.md")):
+        shutil.copyfile(os.path.join(APP_DIR, "README.md"), os.path.join(STORE, "README.md"))
+
+
+def set_location(uuid, subdir):
+    dev = out(["blkid", "-U", uuid]).strip()
+    if not dev:
+        raise RuntimeError("That partition wasn't found.")
+    tree = lsblk_tree()
+    n = find_dev(tree, dev)
+    for mp in mounts_of(n or {}):
+        if mp in SYSTEM_MOUNTS:
+            raise RuntimeError("That's your system's own partition. Pick a separate drive or partition.")
+    fstype = blk(dev, "TYPE")
+    if fstype not in LINUX_FS | OTHER_FS:
+        raise RuntimeError(f"Can't store backups on a '{fstype or 'unknown'}' partition. "
+                           "Use ext4, btrfs, xfs, exFAT, FAT32 or NTFS, or erase it as a backup drive.")
+    subdir = (subdir or "").strip().strip("/")
+    if not SUBDIR_RE.match(subdir) or ".." in subdir:
+        raise RuntimeError("Folder name may only contain letters, numbers, spaces, dots, dashes and underscores.")
+    label = blk(dev, "LABEL")
+    size = int((n or {}).get("size") or 0)
+    loc = {"uuid": uuid, "fstype": fstype, "subdir": subdir, "label": label,
+           "desc": f"{dev}{' “' + label + '”' if label else ''} ({gb(size)} {fstype})",
+           "set": time.strftime("%Y-%m-%d %H:%M")}
+    c = read_conf()
+    c["location"] = loc
+    write_conf(c)
+    if not os.environ.get("PIBACKUP_NOMOUNT"):
+        update_fstab(loc)
+        if os.path.ismount(MNT):
+            run(["umount", MNT], check=False)
+    ensure_mounted()
+    try:
+        os.chmod(BDIR, 0o755)
+    except OSError:
+        pass
+    copy_tools()
+    return loc
+
+
+def cmd_set_location(a):
+    try:
+        loc = set_location(a.uuid, a.subdir)
+    except Exception as e:
+        fail(str(e))
+    where = f" in the folder “{loc['subdir']}”" if loc["subdir"] else ""
+    done_ok(f"Backups will now be stored on {loc['desc']}{where}.")
+
+
+def cmd_format_location(a):
+    if a.confirm != "ERASE":
+        fail("Confirmation missing.")
+    label = (a.label or "PIBACKUP")[:16]
+    if not re.match(r"^[A-Za-z0-9_-]+$", label):
+        fail("Drive name may only contain letters, numbers, - and _.")
+    try:
+        tree = lsblk_tree()
+        n, unmount = check_erasable(tree, a.device)
+        progress(5, "Unmounting")
+        for mp in unmount:
+            run(["umount", mp])
+        for c in reversed(list(walk(n))):
+            run(["wipefs", "-a", c["path"]], check=False)
+        if n["type"] == "disk":
+            progress(20, "Creating partition table")
+            run(["sfdisk", "--quiet", "--wipe", "always", n["path"]], input="label: gpt\n,,L\n")
+            parts = partitions_of(n["path"])
+            if not parts:
+                raise RuntimeError("The new partition didn't appear.")
+            part = parts[0]
+        else:
+            part = n["path"]
+        progress(40, f"Formatting {part} as ext4 “{label}”")
+        run(["mkfs.ext4", "-F", "-q", "-L", label, "-m", "0", part])
+        run(["udevadm", "settle"], check=False)
+        uuid = blk(part, "UUID")
+        progress(80, "Setting it as the backup location")
+        loc = set_location(uuid, "")
+    except Exception as e:
+        fail(str(e))
+    done_ok(f"{part} is now your backup drive: {loc['desc']}.")
+
+
+# ================================================================ options & schedule
+def options_from_args(a, c):
+    o = dict(c.get("options") or {"keep": 3, "pause_services": [], "excludes": []})
+    if getattr(a, "keep", None) is not None:
+        o["keep"] = max(1, min(50, a.keep))
+    if getattr(a, "pause_service", None) is not None:
+        svcs = []
+        for s in a.pause_service:
+            if not SVC_RE.match(s):
+                fail(f"Not a valid service name: {s!r}")
+            svcs.append(s if "." in s else s + ".service")
+        o["pause_services"] = svcs
+    if getattr(a, "exclude", None) is not None:
+        ex = []
+        for p in a.exclude:
+            p = os.path.normpath(p.strip())
+            if not p.startswith("/") or p == "/":
+                fail(f"Folders to skip must be full paths like /home/pi/Videos (got {p!r}).")
+            ex.append(p)
+        o["excludes"] = ex
+    return o
+
+
+def cmd_set_options(a):
+    c = read_conf()
+    c["options"] = options_from_args(a, c)
+    write_conf(c)
+    done_ok("Backup settings saved.")
+
+
+def calendar_expr(s):
+    hh, mm = s["time"].split(":")
+    t = f"{int(hh):02d}:{int(mm):02d}:00"
+    if s["mode"] == "daily":
+        return f"*-*-* {t}"
+    if s["mode"] == "weekly":
+        return f"{','.join(s['days'])} *-*-* {t}"
+    if s["mode"] == "monthly":
+        return f"*-*-{int(s['dom']):02d} {t}"
+    raise ValueError(s["mode"])
+
+
+def cmd_set_schedule(a):
+    c = read_conf()
+    c["options"] = options_from_args(a, c)
+    if a.mode != "off":
+        if not re.match(r"^\d{1,2}:\d{2}$", a.time or "") or int(a.time.split(":")[0]) > 23 \
+                or int(a.time.split(":")[1]) > 59:
+            fail("Pick a valid time.")
+        days = [d for d in (a.days or "").split(",") if d]
+        if a.mode == "weekly" and (not days or any(d not in DAYS for d in days)):
+            fail("Pick at least one day of the week.")
+        if a.mode == "monthly" and not 1 <= (a.dom or 0) <= 28:
+            fail("Pick a day of the month from 1 to 28.")
+    sched = {"mode": a.mode, "time": a.time or "02:30", "days": (a.days or "").split(",") if a.days else [],
+             "dom": a.dom or 1, "persistent": a.persistent, "verify": a.verify}
+    c["schedule"] = sched
+    write_conf(c)
+    tpath, spath = os.path.join(UNIT_DIR, TIMER), os.path.join(UNIT_DIR, SERVICE)
+    if a.mode == "off":
+        run(["systemctl", "disable", "--now", TIMER], check=False)
+        done_ok("Scheduled backups are turned off.")
+    expr = calendar_expr(sched)
+    if out(["systemd-analyze", "calendar", expr]) == "" and shutil.which("systemd-analyze"):
+        fail(f"systemd didn't accept the schedule '{expr}'.")
+    with open(spath, "w") as f:
+        f.write("[Unit]\nDescription=Pi Backup Manager scheduled backup\n"
+                "After=local-fs.target network-online.target\n\n"
+                "[Service]\nType=oneshot\n"
+                f"ExecStart={APP_DIR}/pibackup-helper backup --scheduled\n"
+                "Nice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=7\n")
+    with open(tpath, "w") as f:
+        f.write("[Unit]\nDescription=Pi Backup Manager schedule\n\n"
+                f"[Timer]\nOnCalendar={expr}\nPersistent={'true' if a.persistent else 'false'}\n"
+                "AccuracySec=1min\n\n[Install]\nWantedBy=timers.target\n")
+    run(["systemctl", "daemon-reload"], check=False)
+    run(["systemctl", "enable", "--now", TIMER], check=False)
+    run(["systemctl", "restart", TIMER], check=False)
+    nxt = out(["systemctl", "show", TIMER, "-p", "NextElapseUSecRealtime", "--value"]).strip()
+    done_ok("Schedule saved." + (f" Next backup: {nxt}." if nxt else ""))
+
+
+# ================================================================ backup
+def feed_parts(paths, dest_stdin, p0, p1, label):
+    """Stream several files, in order, into a process's stdin. Returns (whole sha, [part shas])."""
+    total = sum(os.path.getsize(p) for p in paths) or 1
+    whole = hashlib.sha256()
+    part_shas = []
+    done = 0
+    last = 0.0
+    start = time.time()
+    broken = False
+    for path in paths:
+        ph = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                if cancel.is_set():
+                    raise Cancelled()
+                b = f.read(CHUNK)
+                if not b:
+                    break
+                whole.update(b)
+                ph.update(b)
+                if not broken:
+                    try:
+                        dest_stdin.write(b)
+                    except BrokenPipeError:
+                        broken = True
+                done += len(b)
+                now = time.time()
+                if now - last > 0.5:
+                    last = now
+                    rate = done / max(now - start, 0.001)
+                    eta = (total - done) / rate if rate else 0
+                    progress(p0 + (p1 - p0) * done / total,
+                             f"{label}: {gb(done)} of {gb(total)} — about {int(eta // 60)} min {int(eta % 60)} s left")
+        part_shas.append(ph.hexdigest())
+    try:
+        dest_stdin.close()
+    except BrokenPipeError:
+        pass
+    return whole.hexdigest(), part_shas
+
+
+def tar_to_zstd(src, excludes, outbase, est, p0, p1, label, errlog):
+    tar = ["tar", "--create", "--file=-", "--directory", src, "--one-file-system",
+           "--numeric-owner", "--acls", "--xattrs", "--xattrs-include=*", "--sparse",
+           "--warning=no-file-changed", "--warning=no-file-removed",
+           "--warning=no-file-ignored", "--warning=no-xdev", "--anchored"]
+    tar += [f"--exclude={e}" for e in excludes] + ["."]
+    zp = subprocess.Popen(["zstd", "-T0", "-3", "-q", "-c"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    with open(errlog, "ab") as ef:
+        tp = subprocess.Popen(tar, stdout=subprocess.PIPE, stderr=ef)
+    whole = hashlib.sha256()
+    parts, part_shas = [], []
+    written = [0]
+    werr = []
+
+    def writer():
+        f = None
+        ph = None
+        in_part = 0
+        try:
+            while True:
+                b = zp.stdout.read(CHUNK)
+                if not b:
+                    break
+                mv = memoryview(b)
+                while len(mv):
+                    if f is None:
+                        name = f"{outbase}.{len(parts):03d}"
+                        f = open(name, "wb")
+                        ph = hashlib.sha256()
+                        parts.append(os.path.basename(name))
+                        in_part = 0
+                    n = min(len(mv), PART_SIZE - in_part)
+                    chunk = mv[:n]
+                    f.write(chunk)
+                    whole.update(chunk)
+                    ph.update(chunk)
+                    in_part += n
+                    written[0] += n
+                    mv = mv[n:]
+                    if in_part >= PART_SIZE:
+                        f.flush()
+                        os.fsync(f.fileno())
+                        f.close()
+                        part_shas.append(ph.hexdigest())
+                        f = None
+            if f:
+                f.flush()
+                os.fsync(f.fileno())
+                f.close()
+                part_shas.append(ph.hexdigest())
+        except Exception as e:  # e.g. drive full
+            werr.append(e)
+            zp.kill()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    read = 0
+    last = 0.0
+    start = time.time()
+    est = max(est or 1, 1)
+    try:
+        while True:
+            if cancel.is_set():
+                raise Cancelled()
+            b = tp.stdout.read1(CHUNK)
+            if not b:
+                break
+            zp.stdin.write(b)
+            read += len(b)
+            now = time.time()
+            if now - last > 0.5:
+                last = now
+                rate = read / max(now - start, 0.001)
+                eta = max(est - read, 0) / rate if rate else 0
+                progress(p0 + (p1 - p0) * min(read / est, 0.99),
+                         f"{label}: read {gb(read)} of about {gb(est)}, wrote {gb(written[0])} — "
+                         f"about {int(eta // 60)} min left")
+    except (Cancelled, BrokenPipeError) as e:
+        tp.kill()
+        zp.kill()
+        t.join()
+        tp.wait()
+        zp.wait()
+        if isinstance(e, Cancelled):
+            raise
+        raise RuntimeError(f"Writing the backup failed: {werr[0] if werr else 'compressor stopped'}")
+    try:
+        zp.stdin.close()
+    except BrokenPipeError:
+        pass
+    t.join()
+    trc = tp.wait()
+    zrc = zp.wait()
+    if werr:
+        raise RuntimeError(f"Writing the backup failed: {werr[0]}")
+    if trc not in (0, 1):  # 1 = some files changed while being read; normal on a live system
+        raise RuntimeError(f"tar failed (code {trc}); see tar-warnings.log in the backup folder")
+    if zrc != 0:
+        raise RuntimeError(f"zstd failed (code {zrc})")
+    return {"parts": parts, "part_sha256": part_shas, "bytes": written[0],
+            "sha256": whole.hexdigest(), "source_bytes": read}
+
+
+def parse_export(text):
+    d = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def collect_info(work, name, a, opts):
+    info = os.path.join(work, "info")
+    os.makedirs(info)
+
+    def save(fn, text):
+        with open(os.path.join(info, fn), "w") as f:
+            f.write(text)
+
+    def cat(p):
+        try:
+            with open(p) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    root_src = out(["findmnt", "-no", "SOURCE", a.source]).strip().split("[")[0]
+    boot_src = out(["findmnt", "-no", "SOURCE", a.boot]).strip()
+    m = {
+        "name": name,
+        "format": 2,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "scheduled": SCHEDULED,
+        "hostname": os.uname().nodename,
+        "kernel": os.uname().release,
+        "model": cat("/proc/device-tree/model").strip("\x00\n"),
+        "options": opts,
+        "root": {"source": root_src, "uuid": blk(root_src, "UUID"), "label": blk(root_src, "LABEL"),
+                 "partuuid": blk(root_src, "PARTUUID"),
+                 "fstype": out(["findmnt", "-no", "FSTYPE", a.source]).strip()},
+        "boot": {"source": boot_src, "partuuid": blk(boot_src, "PARTUUID"), "label": blk(boot_src, "LABEL")},
+        "files": {},
+    }
+    if root_src.startswith("/dev/md"):
+        exp = parse_export(out(["mdadm", "--detail", "--export", root_src]))
+        detail = out(["mdadm", "--detail", root_src])
+        save("mdadm-detail.txt", detail)
+        m["md"] = {
+            "uuid": exp.get("MD_UUID", ""), "name": exp.get("MD_NAME", ""),
+            "level": exp.get("MD_LEVEL", ""), "metadata": exp.get("MD_METADATA", "1.2"),
+            "devices": int(exp.get("MD_DEVICES", "2") or 2),
+            "bitmap": "internal" if re.search(r"Intent Bitmap\s*:\s*Internal", detail) else "none",
+        }
+    save("lsblk.txt", out(["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,PARTUUID,MOUNTPOINTS"]))
+    save("blkid.txt", out(["blkid"]))
+    save("mdstat.txt", cat("/proc/mdstat"))
+    save("fstab.txt", cat(os.path.join(a.source, "etc/fstab")))
+    save("cmdline.txt", cat(os.path.join(a.boot, "cmdline.txt")))
+    save("config.txt", cat(os.path.join(a.boot, "config.txt")))
+    save("eeprom.txt", out(["rpi-eeprom-config"]))
+    save("packages.txt", out(["dpkg", "--get-selections"]))
+    return m
+
+
+def pause_services(names):
+    stopped = []
+    for s in names:
+        if subprocess.run(["systemctl", "is-active", "-q", s], stderr=subprocess.DEVNULL).returncode == 0:
+            log(f"Pausing {s} for a consistent copy")
+            subprocess.run(["systemctl", "stop", s])
+            stopped.append(s)
+    return stopped
+
+
+def resume_services(stopped):
+    for s in stopped:
+        log(f"Restarting {s}")
+        subprocess.run(["systemctl", "start", s])
+
+
+def delete_backup(name, why):
+    log(f"Deleting old backup {name} ({why})")
+    shutil.rmtree(os.path.join(BDIR, name), ignore_errors=True)
+
+
+def exclude_patterns(source, paths):
+    pats = []
+    for p in paths:
+        rel = "." + p
+        pats.append(rel + "/*" if os.path.isdir(os.path.join(source, p.lstrip("/"))) else rel)
+    return pats
+
+
+def cmd_backup(a):
+    global SCHEDULED
+    SCHEDULED = a.scheduled
+    c = ensure_mounted()
+    if a.scheduled:
+        opts = c.get("options") or {"keep": 3, "pause_services": [], "excludes": []}
+    else:
+        opts = options_from_args(a, c)
+        if a.save_options:
+            c["options"] = opts
+            write_conf(c)
+    take_lock()
+    try:
+        os.chmod(BDIR, 0o755)
+    except OSError:
+        pass
+    keep = max(1, int(opts.get("keep", 3)))
+    name = time.strftime("%Y-%m-%d_%H%M")
+    if os.path.exists(os.path.join(BDIR, name)):
+        fail(f"A backup called {name} already exists. Wait a minute and try again.")
+    for d in os.listdir(BDIR):
+        if d.startswith(".partial-"):
+            shutil.rmtree(os.path.join(BDIR, d), ignore_errors=True)
+    work = os.path.join(BDIR, ".partial-" + name)
+    os.makedirs(work)
+
+    st = os.statvfs(a.source)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    prev = [load_manifest(os.path.join(BDIR, b)) for b in list_backups()[-1:]]
+    need = int(sum(f["bytes"] for f in prev[0]["files"].values()) * 1.15) if prev else int(used * 0.6)
+    old = list_backups()
+    while shutil.disk_usage(BDIR).free < need and old:
+        delete_backup(old.pop(0), "making room")
+    free = shutil.disk_usage(BDIR).free
+    if free < need * 0.6:
+        shutil.rmtree(work, ignore_errors=True)
+        fail(f"Not enough room at the backup location: {gb(free)} free, about {gb(need)} needed.")
+    log(f"System uses {gb(used)}; {gb(free)} free at the backup location")
+
+    stopped = []
+    errlog = os.path.join(work, "tar-warnings.log")
+    try:
+        m = collect_info(work, name, a, opts)
+        if os.path.isdir(a.boot) and os.listdir(a.boot):
+            progress(1, "Backing up the boot partition")
+            m["files"]["boot.tar.zst"] = tar_to_zstd(a.boot, [], os.path.join(work, "boot.tar.zst"),
+                                                     100_000_000, 1, 3, "Boot partition", errlog)
+        stopped = pause_services(opts.get("pause_services") or [])
+        excl = EXCLUDES + exclude_patterns(a.source, opts.get("excludes") or [])
+        m["files"]["root.tar.zst"] = tar_to_zstd(a.source, excl, os.path.join(work, "root.tar.zst"),
+                                                 used, 3, 97, "System", errlog)
+    except Cancelled:
+        resume_services(stopped)
+        shutil.rmtree(work, ignore_errors=True)
+        fail("Backup cancelled. Nothing was kept.")
+    except Exception as e:
+        resume_services(stopped)
+        shutil.rmtree(work, ignore_errors=True)
+        fail(str(e))
+    resume_services(stopped)
+
+    with open(os.path.join(work, "SHA256SUMS"), "w") as f:
+        for r in m["files"].values():
+            for pn, ps in zip(r["parts"], r["part_sha256"]):
+                f.write(f"{ps}  {pn}\n")
+    for r in m["files"].values():
+        for pn in r["parts"]:
+            try:
+                os.chmod(os.path.join(work, pn), 0o600)  # contains /etc/shadow etc.
+            except OSError:
+                pass
+    save_manifest(work, m)
+    subprocess.run(["sync"])
+    os.rename(work, os.path.join(BDIR, name))
+
+    old = [b for b in list_backups() if b != name]
+    while len(old) > keep - 1:
+        delete_backup(old.pop(0), f"keeping the newest {keep}")
+    total = sum(r["bytes"] for r in m["files"].values())
+    msg = f"Backup {name} finished: {gb(total)}."
+    if a.scheduled and (c.get("schedule") or {}).get("verify"):
+        problem = verify_backup(os.path.join(BDIR, name), 97, 100)
+        if problem:
+            fail(f"Backup {name} was made but failed its check: {problem}")
+        msg += " Checked OK."
+    progress(100, "Done")
+    done_ok(msg)
+
+
+# ================================================================ verify
+def verify_backup(d, p0=0, p1=100):
+    m = load_manifest(d)
+    files = [fn for fn in ("boot.tar.zst", "root.tar.zst") if fn in m["files"]]
+    sizes = [sum(os.path.getsize(p) for p in part_paths(d, m["files"][fn])) for fn in files]
+    total = sum(sizes) or 1
+    pos = 0
+    for fn, sz in zip(files, sizes):
+        e = m["files"][fn]
+        a0 = p0 + (p1 - p0) * pos / total
+        pos += sz
+        a1 = p0 + (p1 - p0) * pos / total
+        zp = subprocess.Popen(["zstd", "-dc", "-q"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+        with tempfile.TemporaryFile() as ef:
+            tp = subprocess.Popen(["tar", "-tf", "-"], stdin=zp.stdout, stdout=subprocess.DEVNULL, stderr=ef)
+            zp.stdout.close()
+            try:
+                missing = [p for p in part_paths(d, e) if not os.path.isfile(p)]
+                if missing:
+                    zp.kill()
+                    tp.kill()
+                    return f"{fn}: file {os.path.basename(missing[0])} is missing"
+                sha, part_shas = feed_parts(part_paths(d, e), zp.stdin, a0, a1, f"Checking {fn}")
+            except Cancelled:
+                zp.kill()
+                tp.kill()
+                raise
+            zrc, trc = zp.wait(), tp.wait()
+            ef.seek(0)
+            err = ef.read().decode(errors="replace").strip()
+        for pn, got, want in zip(e["parts"], part_shas, e.get("part_sha256", [])):
+            if got != want:
+                return f"{pn} is damaged (checksum doesn't match)"
+        if sha != e["sha256"]:
+            return f"{fn} is damaged (checksum doesn't match)"
+        if zrc != 0:
+            return f"{fn}: decompression failed"
+        if trc != 0:
+            return f"{fn}: archive is damaged: {err[:300]}"
+    m["verified"] = time.strftime("%Y-%m-%d %H:%M")
+    save_manifest(d, m)
+    return None
+
+
+def cmd_verify(a):
+    ensure_mounted()
+    d = backup_dir(a.name)
+    take_lock()
+    try:
+        problem = verify_backup(d)
+    except Cancelled:
+        fail("Check cancelled.")
+    if problem:
+        m = load_manifest(d)
+        m["verified"] = f"FAILED {time.strftime('%Y-%m-%d %H:%M')}"
+        save_manifest(d, m)
+        fail(problem)
+    done_ok(f"Backup {a.name} checked: every file reads back correctly.")
+
+
+# ================================================================ restore
+def extract(paths, dest, members, p0, p1, label, vfat=False):
+    tar = ["tar", "-x", "-f", "-", "-C", dest]
+    if vfat:
+        tar += ["--no-same-owner", "--no-same-permissions"]
+    else:
+        tar += ["--numeric-owner", "--same-owner", "-p", "--acls", "--xattrs",
+                "--xattrs-include=*", "--sparse"]
+    tar += members
+    zp = subprocess.Popen(["zstd", "-dc", "-q"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    with tempfile.TemporaryFile() as ef:
+        tp = subprocess.Popen(tar, stdin=zp.stdout, stderr=ef)
+        zp.stdout.close()
+        try:
+            feed_parts(paths, zp.stdin, p0, p1, label)
+        except Cancelled:
+            zp.kill()
+            tp.kill()
+            raise
+        zrc, trc = zp.wait(), tp.wait()
+        ef.seek(0)
+        err = ef.read().decode(errors="replace").strip()
+    if zrc != 0:
+        raise RuntimeError("Decompression failed; run Check on this backup.")
+    if trc != 0:
+        if "Not found in archive" in err:
+            raise RuntimeError("That path isn't in this backup:\n" + err[:500])
+        raise RuntimeError(f"Extracting failed (code {trc}):\n{err[:500]}")
+
+
+def cmd_restore_files(a):
+    ensure_mounted()
+    d = backup_dir(a.name)
+    m = load_manifest(d)
+    members = []
+    for p in a.paths:
+        p = os.path.normpath("/" + p.strip()).lstrip("/")
+        if not p or p.startswith(".."):
+            fail("Choose a folder or file inside the backup, not the whole system.")
+        members.append("./" + p)
+    dest = os.path.abspath(a.dest)
+    if not (dest.startswith("/home/") or dest.startswith("/root/")):
+        fail("Files can only be restored into a folder under /home.")
+    os.makedirs(dest, exist_ok=True)
+    take_lock()
+    try:
+        extract(part_paths(d, m["files"]["root.tar.zst"]), dest, members, 0, 100, "Restoring files")
+    except Cancelled:
+        fail("Restore cancelled; anything already extracted is in " + dest)
+    except Exception as e:
+        fail(str(e))
+    uid = os.environ.get("PKEXEC_UID")
+    if uid and uid.isdigit():
+        gid = int(out(["id", "-g", uid]).strip() or uid)
+        os.chown(dest, int(uid), gid)
+        parent = os.path.dirname(dest)
+        if os.path.basename(parent) == "Restored":
+            os.chown(parent, int(uid), gid)
+    done_ok(f"Restored into {dest}")
+
+
+def make_mountpoints(root):
+    for p, mode in (("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755),
+                    ("tmp", 0o1777), ("var/tmp", 0o1777), ("mnt", 0o755), ("media", 0o755),
+                    ("boot/firmware", 0o755), ("mnt/pibackup", 0o755)):
+        q = os.path.join(root, p)
+        os.makedirs(q, exist_ok=True)
+        os.chmod(q, mode)
+
+
+def patch_fstab(root, mapping):
+    fstab = os.path.join(root, "etc/fstab")
+    if not os.path.isfile(fstab):
+        return
+    lines = open(fstab).read().splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        f = line.split()
+        if len(f) >= 2 and not line.lstrip().startswith("#") and f[1] in mapping:
+            lines[i] = line.replace(f[0], mapping[f[1]], 1)
+            log(f"fstab: {f[1]} now uses {mapping[f[1]]}")
+    with open(fstab, "w") as fh:
+        fh.writelines(lines)
+
+
+def patch_cmdline(bootdir, root_spec):
+    p = os.path.join(bootdir, "cmdline.txt")
+    if os.path.isfile(p):
+        s = open(p).read()
+        s2 = re.sub(r"\broot=\S+", f"root={root_spec}", s)
+        if s2 != s:
+            with open(p, "w") as f:
+                f.write(s2)
+            log(f"cmdline.txt: root={root_spec}")
+
+
+def check_targets(tree, disks, m, c):
+    loc_uuid = (c.get("location") or {}).get("uuid")
+    need = m["files"]["root.tar.zst"].get("source_bytes", 0) * 1.1 + 600e6
+    for disk in disks:
+        n = find_dev(tree, disk)
+        if not n or n.get("type") != "disk":
+            raise RuntimeError(f"{disk} isn't a whole drive.")
+        for ch in walk(n):
+            if loc_uuid and ch.get("uuid") == loc_uuid:
+                raise RuntimeError(f"{disk} holds the backups themselves.")
+            for mp in mounts_of(ch):
+                if not (mp.startswith("/media/") or mp.startswith("/run/media/")):
+                    raise RuntimeError(f"{disk} is in use right now ({ch['path']} is mounted at {mp}). "
+                                       "Restore onto a drive the Pi isn't running from; see the README.")
+        if int(n.get("size") or 0) < need:
+            raise RuntimeError(f"{disk} is too small ({gb(int(n['size']))}; needs at least {gb(need)}).")
+
+
+def wipe_disks(tree, disks):
+    for disk in disks:  # unmount desktop automounts (check_targets allowed only those)
+        for ch in reversed(list(walk(find_dev(tree, disk)))):
+            for mp in mounts_of(ch):
+                log(f"Unmounting {mp}")
+                run(["umount", mp])
+    for disk in disks:
+        for ch in walk(find_dev(tree, disk)):
+            if (ch.get("type") or "").startswith("raid") and os.path.exists(ch["path"]):
+                log(f"Stopping old array {ch['path']}")
+                run(["mdadm", "--stop", ch["path"]], check=False)
+    for disk in disks:
+        log(f"Wiping {disk}")
+        for ch in reversed(list(walk(find_dev(tree, disk)))):
+            if ch.get("type") == "part":
+                run(["wipefs", "-a", ch["path"]], check=False)
+        run(["mdadm", "--zero-superblock", "--force", disk], check=False)
+        run(["wipefs", "-a", disk])
+
+
+def restore_standard(d, m, disk, tree):
+    if "boot.tar.zst" not in m["files"]:
+        raise RuntimeError("This backup has no boot partition, so it can't be rebuilt as a standard drive.")
+    size = int(find_dev(tree, disk)["size"])
+    progress(1, "Partitioning")
+    wipe_disks(tree, [disk])
+    if size > 2_000_000_000_000:
+        script = ("label: gpt\n,512MiB,EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n"
+                  ",,0FC63DAF-8483-4772-8E79-3D69D8477DE4\n")
+    else:
+        script = "label: dos\n,512MiB,c,*\n,,L\n"
+    run(["sfdisk", "--quiet", "--wipe", "always", disk], input=script)
+    parts = partitions_of(disk)
+    if len(parts) < 2:
+        raise RuntimeError("The new partitions didn't appear.")
+    p1, p2 = parts[0], parts[1]
+    progress(3, "Formatting")
+    run(["mkfs.vfat", "-F", "32", "-n", (m["boot"].get("label") or "bootfs")[:11], p1])
+    mk = ["mkfs.ext4", "-F", "-q", "-L", m["root"].get("label") or "rootfs"]
+    if m["root"].get("uuid"):
+        mk += ["-U", m["root"]["uuid"]]
+    run(mk + [p2])
+    run(["udevadm", "settle"], check=False)
+    os.makedirs(TARGET_MNT, exist_ok=True)
+    os.makedirs(BOOT_MNT, exist_ok=True)
+    run(["mount", p2, TARGET_MNT])
+    try:
+        extract(part_paths(d, m["files"]["root.tar.zst"]), TARGET_MNT, [], 5, 93, "Restoring system")
+        make_mountpoints(TARGET_MNT)
+        run(["mount", p1, BOOT_MNT])
+        try:
+            extract(part_paths(d, m["files"]["boot.tar.zst"]), BOOT_MNT, [], 93, 96,
+                    "Restoring boot files", vfat=True)
+            root_spec = f"PARTUUID={blk(p2, 'PARTUUID')}"
+            boot_spec = f"PARTUUID={blk(p1, 'PARTUUID')}"
+            patch_cmdline(BOOT_MNT, root_spec)
+            patch_fstab(TARGET_MNT, {"/": root_spec, "/boot/firmware": boot_spec, "/boot": boot_spec})
+            progress(98, "Flushing to disk")
+            subprocess.run(["sync"])
+        finally:
+            run(["umount", BOOT_MNT], check=False)
+    finally:
+        run(["umount", TARGET_MNT], check=False)
+    note = ""
+    if m.get("md"):
+        note = (" This backup came from a RAID system; on the single drive the old RAID settings are unused. "
+                "You can remove the ARRAY line from /etc/mdadm/mdadm.conf.")
+    return ("System rebuilt on " + disk + ". It's a complete bootable drive. Shut down, make sure the Pi "
+            "boots from it (remove the old drive or set the boot order), and power on." + note)
+
+
+def restore_raid(d, m, disks, boot_part, tree):
+    md = m.get("md")
+    if not md:
+        raise RuntimeError("This backup wasn't taken from a RAID system; use the single-drive rebuild.")
+    progress(1, "Preparing drives")
+    wipe_disks(tree, disks)
+    mddev = next(f"/dev/md{i}" for i in range(127, 0, -1) if not os.path.exists(f"/dev/md{i}"))
+    cmd = ["mdadm", "--create", mddev, "--run", "--level=1", "--raid-devices=2",
+           f"--metadata={md.get('metadata') or '1.2'}", f"--bitmap={md.get('bitmap') or 'internal'}"]
+    if md.get("uuid"):
+        cmd.append(f"--uuid={md['uuid']}")
+    if md.get("name"):
+        host, _, nm = md["name"].rpartition(":")
+        if host:
+            cmd += ["--homehost", host]
+        cmd += ["--name", nm]
+    cmd += disks + (["missing"] if len(disks) == 1 else [])
+    log("Creating RAID1 mirror " + mddev)
+    run(cmd, input="y\n")
+    run(["udevadm", "settle"], check=False)
+    progress(4, "Formatting")
+    mk = ["mkfs.ext4", "-F", "-q"]
+    if m["root"].get("uuid"):
+        mk += ["-U", m["root"]["uuid"]]
+    if m["root"].get("label"):
+        mk += ["-L", m["root"]["label"]]
+    run(mk + [mddev])
+    os.makedirs(TARGET_MNT, exist_ok=True)
+    run(["mount", mddev, TARGET_MNT])
+    try:
+        extract(part_paths(d, m["files"]["root.tar.zst"]), TARGET_MNT, [], 5, 92, "Restoring system")
+        make_mountpoints(TARGET_MNT)
+        if boot_part:
+            n = find_dev(tree, boot_part)
+            if not n or n.get("type") != "part" or n.get("fstype") != "vfat":
+                raise RuntimeError(f"{boot_part} isn't a FAT boot partition.")
+            if mounts_of(n):
+                raise RuntimeError(f"{boot_part} is mounted; it's probably the running system's boot partition.")
+            os.makedirs(BOOT_MNT, exist_ok=True)
+            run(["mount", boot_part, BOOT_MNT])
+            try:
+                for e in os.listdir(BOOT_MNT):
+                    p = os.path.join(BOOT_MNT, e)
+                    shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+                extract(part_paths(d, m["files"]["boot.tar.zst"]), BOOT_MNT, [], 92, 96,
+                        "Restoring boot files", vfat=True)
+            finally:
+                subprocess.run(["sync"])
+                run(["umount", BOOT_MNT], check=False)
+            spec = f"PARTUUID={blk(boot_part, 'PARTUUID')}"
+            patch_fstab(TARGET_MNT, {"/boot/firmware": spec, "/boot": spec})
+        progress(98, "Flushing to disk")
+        subprocess.run(["sync"])
+    finally:
+        run(["umount", TARGET_MNT], check=False)
+    msg = ("System rebuilt. Shut down, remove the rescue drive, put the boot SD card back in the Pi's own "
+           "slot, and power on. The mirror finishes syncing in the background (cat /proc/mdstat).")
+    if len(disks) == 1:
+        msg += f" The mirror has one drive; add the second later with 'sudo mdadm --add {mddev} /dev/<drive>'."
+    return msg
+
+
+def cmd_restore_system(a):
+    if a.confirm != "ERASE":
+        fail("Confirmation missing.")
+    c = ensure_mounted()
+    d = backup_dir(a.name)
+    m = load_manifest(d)
+    if not 1 <= len(a.disks) <= 2 or len(set(a.disks)) != len(a.disks):
+        fail("Choose one or two different drives.")
+    if a.mode == "standard" and len(a.disks) != 1:
+        fail("A standard rebuild uses exactly one drive.")
+    take_lock()
+    tree = lsblk_tree()
+    try:
+        check_targets(tree, a.disks, m, c)
+        if a.mode == "standard":
+            msg = restore_standard(d, m, a.disks[0], tree)
+        else:
+            msg = restore_raid(d, m, a.disks, a.boot_part, tree)
+    except Cancelled:
+        fail("Cancelled part-way. The drive is NOT bootable; run the rebuild again.")
+    except Exception as e:
+        fail(str(e))
+    done_ok(msg)
+
+
+# ================================================================ misc
+def cmd_delete(a):
+    ensure_mounted()
+    backup_dir(a.name)
+    take_lock()
+    delete_backup(a.name, "requested")
+    done_ok(f"Deleted {a.name}.")
+
+
+def cmd_mount(a):
+    ensure_mounted()
+    done_ok("Backup location mounted.")
+
+
+def add_option_args(p):
+    p.add_argument("--keep", type=int)
+    p.add_argument("--pause-service", action="append")
+    p.add_argument("--exclude", action="append")
+    p.add_argument("--no-pause", dest="pause_service", action="store_const", const=[])
+    p.add_argument("--no-exclude", dest="exclude", action="store_const", const=[])
+
+
+def main():
+    if os.geteuid() != 0:
+        fail("This helper must run as root.")
+    ap = argparse.ArgumentParser(prog="pibackup-helper")
+    ap.add_argument("--watch-stdin", action="store_true",
+                    help="cancel the running job when stdin closes (used by the GUI)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("backup")
+    add_option_args(b)
+    b.add_argument("--save-options", action="store_true", help="also store these settings for scheduled runs")
+    b.add_argument("--scheduled", action="store_true", help="use stored settings (run by the timer)")
+    b.add_argument("--source", default="/")
+    b.add_argument("--boot", default="/boot/firmware")
+    v = sub.add_parser("verify")
+    v.add_argument("name")
+    r = sub.add_parser("restore-files")
+    r.add_argument("name")
+    r.add_argument("--dest", required=True)
+    r.add_argument("paths", nargs="+")
+    s = sub.add_parser("restore-system")
+    s.add_argument("name")
+    s.add_argument("--mode", choices=["standard", "raid"], default="standard")
+    s.add_argument("--disk", dest="disks", action="append", required=True)
+    s.add_argument("--boot-part")
+    s.add_argument("--confirm", required=True)
+    dl = sub.add_parser("delete")
+    dl.add_argument("name")
+    sub.add_parser("mount")
+    sl = sub.add_parser("set-location")
+    sl.add_argument("--uuid", required=True)
+    sl.add_argument("--subdir", default="pi-backups")
+    fl = sub.add_parser("format-location")
+    fl.add_argument("device")
+    fl.add_argument("--label", default="PIBACKUP")
+    fl.add_argument("--confirm", required=True)
+    so = sub.add_parser("set-options")
+    add_option_args(so)
+    sc = sub.add_parser("set-schedule")
+    add_option_args(sc)
+    sc.add_argument("--mode", choices=["off", "daily", "weekly", "monthly"], required=True)
+    sc.add_argument("--time", default="02:30")
+    sc.add_argument("--days", default="")
+    sc.add_argument("--dom", type=int, default=1)
+    sc.add_argument("--persistent", action="store_true")
+    sc.add_argument("--verify", action="store_true")
+    a = ap.parse_args()
+
+    signal.signal(signal.SIGTERM, lambda *_: cancel.set())
+    if a.watch_stdin:
+        watch_stdin()
+    try:
+        {"backup": cmd_backup, "verify": cmd_verify, "restore-files": cmd_restore_files,
+         "restore-system": cmd_restore_system, "delete": cmd_delete, "mount": cmd_mount,
+         "set-location": cmd_set_location, "format-location": cmd_format_location,
+         "set-options": cmd_set_options, "set-schedule": cmd_set_schedule}[a.cmd](a)
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail(f"Unexpected error: {e}")
+
+
+if __name__ == "__main__":
+    main()

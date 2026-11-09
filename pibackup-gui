@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+"""Pi Backup Manager - compressed, restorable whole-system backups for Raspberry Pi."""
+import calendar as calmod
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
+MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
+CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
+STATE = os.environ.get("PIBACKUP_STATE", "/var/lib/pibackup")
+NAME_RE = re.compile(r"^\d{4}-\d\d-\d\d_\d{4}$")
+SYSTEM_MOUNTS = {"/", "/boot", "/boot/firmware", "[SWAP]"}
+USABLE_FS = {"ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs"}
+SHARED_FS = {"vfat", "exfat", "ntfs"}
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DATA_SVC = re.compile(r"influx|maria|mysql|postgres|mongo|redis|mosquitto|elastic|prometheus|"
+                      r"grafana|home-?assistant|nextcloud|docker|containerd|couch|minio|syncthing", re.I)
+OLLAMA_DIRS = ["/usr/share/ollama/.ollama/models", "/var/lib/ollama/models"]
+DEFAULT_OPTS = {"keep": 3, "pause_services": [], "excludes": []}
+
+
+def gb(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
+# ---------------------------------------------------------------- data helpers (no root needed)
+def read_conf():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def store_dir(conf):
+    loc = conf.get("location") or {}
+    return os.path.join(MNT, loc["subdir"]) if loc.get("subdir") else MNT
+
+
+def location_mounted(conf):
+    loc = conf.get("location")
+    if not loc:
+        return False
+    if os.environ.get("PIBACKUP_NOMOUNT"):
+        return True
+    if not os.path.ismount(MNT):
+        return False
+    u = subprocess.run(["findmnt", "-no", "UUID", MNT], capture_output=True, text=True).stdout.strip()
+    return u == loc["uuid"]
+
+
+def read_backups(conf):
+    bdir = os.path.join(store_dir(conf), "backups")
+    res = []
+    if not os.path.isdir(bdir):
+        return res
+    for n in sorted(os.listdir(bdir), reverse=True):
+        p = os.path.join(bdir, n, "manifest.json")
+        if NAME_RE.match(n) and os.path.isfile(p):
+            try:
+                with open(p) as f:
+                    res.append(json.load(f))
+            except Exception:
+                pass
+    return res
+
+
+def disk_usage(path):
+    return shutil.disk_usage(path)
+
+
+def block_devices():
+    try:
+        j = subprocess.run(["lsblk", "-J", "-b", "-o",
+                            "NAME,PATH,SIZE,TYPE,TRAN,MODEL,FSTYPE,LABEL,UUID,MOUNTPOINTS,RM,FSSIZE,FSUSED"],
+                           capture_output=True, text=True).stdout
+        return json.loads(j)["blockdevices"]
+    except Exception:
+        return []
+
+
+def running_services():
+    r = subprocess.run(["systemctl", "list-units", "--type=service", "--state=running",
+                        "--no-legend", "--plain"], capture_output=True, text=True).stdout
+    return sorted({line.split()[0] for line in r.splitlines() if line.strip()})
+
+
+def last_scheduled():
+    try:
+        with open(os.path.join(STATE, "last-scheduled.json")) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def walk(n):
+    yield n
+    for c in n.get("children") or []:
+        yield from walk(c)
+
+
+def mounts_of(n):
+    return [p for p in (n.get("mountpoints") or []) if p]
+
+
+def backup_size(m):
+    return sum(f.get("bytes", 0) for f in m.get("files", {}).values())
+
+
+def schedule_matches(s, day):
+    if not s or s.get("mode") in (None, "off"):
+        return False
+    if s["mode"] == "daily":
+        return True
+    if s["mode"] == "weekly":
+        return DAYS[day.weekday()] in s.get("days", [])
+    if s["mode"] == "monthly":
+        return day.day == int(s.get("dom", 1))
+    return False
+
+
+def next_runs(s, count=3):
+    if not s or s.get("mode") in (None, "off"):
+        return []
+    hh, mm = (int(x) for x in s.get("time", "02:30").split(":"))
+    now = dt.datetime.now()
+    day = now.date()
+    res = []
+    for _ in range(400):
+        when = dt.datetime.combine(day, dt.time(hh, mm))
+        if when > now and schedule_matches(s, day):
+            res.append(when)
+            if len(res) >= count:
+                break
+        day += dt.timedelta(days=1)
+    return res
+
+
+CSS = b"""
+.cal-day { min-width: 48px; min-height: 42px; padding: 1px; border-radius: 8px; }
+.cal-other { opacity: 0.40; }
+.cal-today { border: 2px solid #3584e4; }
+.cal-backup { background-image: none; background-color: #cfeed7; color: #14361d; }
+.cal-sched { background-image: none; background-color: #d9e6fb; color: #13284d; }
+.cal-selected { background-image: none; background-color: #3584e4; color: #ffffff; }
+"""
+
+
+class MonthGrid(Gtk.Box):
+    """A friendly month view: each day is a tile; ✓ = backup made, • = backup scheduled."""
+
+    def __init__(self, marks_func, on_select):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.marks_func = marks_func
+        self.on_select = on_select
+        today = dt.date.today()
+        self.year, self.month, self.selected = today.year, today.month, today
+        hdr = Gtk.Box(spacing=4)
+        prev, nxt, tb = Gtk.Button(label="‹"), Gtk.Button(label="›"), Gtk.Button(label="Today")
+        prev.set_tooltip_text("Previous month")
+        nxt.set_tooltip_text("Next month")
+        prev.connect("clicked", lambda *_: self.shift(-1))
+        nxt.connect("clicked", lambda *_: self.shift(1))
+        tb.connect("clicked", lambda *_: self.select(dt.date.today()))
+        self.title = Gtk.Label()
+        self.title.set_hexpand(True)
+        for w in (prev, self.title, nxt, tb):
+            hdr.pack_start(w, w is self.title, w is self.title, 0)
+        self.pack_start(hdr, False, False, 0)
+        grid = Gtk.Grid(row_spacing=3, column_spacing=3, row_homogeneous=True, column_homogeneous=True)
+        for i, d in enumerate(DAYS):
+            lab = Gtk.Label()
+            lab.set_markup(f"<small><b>{d}</b></small>")
+            grid.attach(lab, i, 0, 1, 1)
+        self.cells = []
+        for r in range(6):
+            for c in range(7):
+                b = Gtk.Button()
+                lab = Gtk.Label()
+                lab.set_justify(Gtk.Justification.CENTER)
+                b.add(lab)
+                b.get_style_context().add_class("cal-day")
+                b.connect("clicked", lambda btn: self.select(btn.day))
+                grid.attach(b, c, r + 1, 1, 1)
+                self.cells.append((b, lab))
+        self.pack_start(grid, False, False, 0)
+        self.redraw()
+
+    def shift(self, n):
+        m = self.month - 1 + n
+        self.year, self.month = self.year + m // 12, m % 12 + 1
+        self.redraw()
+
+    def select(self, day):
+        self.selected = day
+        self.year, self.month = day.year, day.month
+        self.redraw()
+        self.on_select(day)
+
+    def redraw(self):
+        self.title.set_markup(f"<b>{calmod.month_name[self.month]} {self.year}</b>")
+        first = dt.date(self.year, self.month, 1)
+        start = first - dt.timedelta(days=first.weekday())
+        today = dt.date.today()
+        for i, (b, lab) in enumerate(self.cells):
+            d = start + dt.timedelta(days=i)
+            b.day = d
+            made, sched = self.marks_func(d)
+            sym = " ".join(x for x, on in (("✓", made), ("•", sched)) if on) or " "
+            num = f"<b>{d.day}</b>" if made else str(d.day)
+            lab.set_markup(f"{num}\n<small>{sym}</small>")
+            ctx = b.get_style_context()
+            for cls in ("cal-other", "cal-today", "cal-backup", "cal-sched", "cal-selected"):
+                ctx.remove_class(cls)
+            if d.month != self.month:
+                ctx.add_class("cal-other")
+            if d == today:
+                ctx.add_class("cal-today")
+            if d == self.selected:
+                ctx.add_class("cal-selected")
+            elif made:
+                ctx.add_class("cal-backup")
+            elif sched:
+                ctx.add_class("cal-sched")
+            tip = []
+            if made:
+                tip.append("Backup made")
+            if sched:
+                tip.append("Backup scheduled")
+            b.set_tooltip_text(", ".join(tip) or None)
+
+
+# ---------------------------------------------------------------- window
+class App(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Pi Backup Manager")
+        self.set_default_size(940, 700)
+        self.set_border_width(10)
+        self.proc = None
+        self.got_done = False
+        self.after_job = None
+        self.last_ok = False
+        self.conf = read_conf()
+        self.backups = []
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.add(root)
+        top = Gtk.Box(spacing=8)
+        self.status = Gtk.Label(xalign=0)
+        self.status.set_line_wrap(True)
+        top.pack_start(self.status, True, True, 0)
+        self.mount_btn = Gtk.Button(label="Connect backup drive")
+        self.mount_btn.connect("clicked", lambda *_: self.run_job(["mount"], "Mounting…"))
+        top.pack_start(self.mount_btn, False, False, 0)
+        root.pack_start(top, False, False, 0)
+
+        self.nb = Gtk.Notebook()
+        root.pack_start(self.nb, True, True, 0)
+        self.nb.append_page(self.build_backup_tab(), Gtk.Label(label="Back up"))
+        self.nb.append_page(self.build_schedule_tab(), Gtk.Label(label="Schedule"))
+        self.nb.append_page(self.build_restore_tab(), Gtk.Label(label="Restore"))
+        self.nb.append_page(self.build_location_tab(), Gtk.Label(label="Backup location"))
+
+        self.bar = Gtk.ProgressBar(show_text=True)
+        self.bar.set_text("Idle")
+        root.pack_start(self.bar, False, False, 0)
+        self.expander = Gtk.Expander(label="Details")
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(110)
+        self.logview = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.logview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        sw.add(self.logview)
+        self.expander.add(sw)
+        root.pack_start(self.expander, False, False, 0)
+        row = Gtk.Box(spacing=8)
+        self.cancel_btn = Gtk.Button(label="Cancel")
+        self.cancel_btn.set_sensitive(False)
+        self.cancel_btn.connect("clicked", self.on_cancel)
+        row.pack_end(self.cancel_btn, False, False, 0)
+        root.pack_start(row, False, False, 0)
+
+        self.action_widgets = [self.backup_btn, self.verify_btn, self.delete_btn, self.mount_btn,
+                               self.files_btn, self.rebuild_btn, self.use_btn, self.format_btn,
+                               self.sched_save_btn]
+        self.load_options_into_ui()
+        self.load_schedule_into_ui()
+        self.refresh()
+        self.connect("delete-event", self.on_close)
+
+    # ============================================================ Back up tab
+    def build_backup_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, border_width=8)
+        self.store = Gtk.ListStore(str, str, str, str, str)
+        tv = Gtk.TreeView(model=self.store)
+        for i, title in enumerate(["Backup", "Taken", "Size", "Checked", "Notes"]):
+            r = Gtk.CellRendererText()
+            if i == 4:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, r, text=i)
+            col.set_resizable(True)
+            col.set_expand(i == 4)
+            tv.append_column(col)
+        self.tree = tv
+        sw = Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+
+        g = Gtk.Grid(column_spacing=8, row_spacing=6)
+        g.attach(Gtk.Label(label="Pause while copying", xalign=0), 0, 0, 1, 1)
+        self.pause_lbl = Gtk.Label(xalign=0)
+        self.pause_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.pause_lbl.set_hexpand(True)
+        g.attach(self.pause_lbl, 1, 0, 1, 1)
+        pb = Gtk.Button(label="Choose services…")
+        pb.connect("clicked", self.on_choose_services)
+        g.attach(pb, 2, 0, 1, 1)
+        g.attach(Gtk.Label(label="Skip these folders", xalign=0), 0, 1, 1, 1)
+        self.excl_entry = Gtk.Entry()
+        self.excl_entry.set_placeholder_text("e.g. /home/pi/Videos; /srv/cache")
+        self.excl_entry.set_tooltip_text("Full paths, separated by ;")
+        g.attach(self.excl_entry, 1, 1, 1, 1)
+        ab = Gtk.Button(label="Add folder…")
+        ab.connect("clicked", self.on_add_exclude)
+        g.attach(ab, 2, 1, 1, 1)
+        g.attach(Gtk.Label(label="Keep the newest", xalign=0), 0, 2, 1, 1)
+        kb = Gtk.Box(spacing=6)
+        self.keep_spin = Gtk.SpinButton.new_with_range(1, 50, 1)
+        kb.pack_start(self.keep_spin, False, False, 0)
+        kb.pack_start(Gtk.Label(label="backups (older ones are deleted automatically)"), False, False, 0)
+        g.attach(kb, 1, 2, 2, 1)
+        box.pack_start(g, False, False, 0)
+
+        btns = Gtk.Box(spacing=8)
+        self.backup_btn = Gtk.Button(label="Back up now")
+        self.backup_btn.get_style_context().add_class("suggested-action")
+        self.backup_btn.connect("clicked", self.on_backup)
+        self.verify_btn = Gtk.Button(label="Check selected")
+        self.verify_btn.connect("clicked", self.on_verify)
+        self.delete_btn = Gtk.Button(label="Delete selected")
+        self.delete_btn.connect("clicked", self.on_delete)
+        refresh = Gtk.Button(label="Refresh")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        for w in (self.backup_btn, self.verify_btn, self.delete_btn):
+            btns.pack_start(w, False, False, 0)
+        btns.pack_end(refresh, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+        return box
+
+    def load_options_into_ui(self):
+        o = dict(DEFAULT_OPTS, **(self.conf.get("options") or {}))
+        if not self.conf.get("options"):
+            o["excludes"] = [d for d in OLLAMA_DIRS if os.path.isdir(d)]
+        self.pause_services = list(o["pause_services"])
+        self.update_pause_label()
+        self.excl_entry.set_text("; ".join(o["excludes"]))
+        self.keep_spin.set_value(o["keep"])
+
+    def update_pause_label(self):
+        self.pause_lbl.set_text(", ".join(s.replace(".service", "") for s in self.pause_services)
+                                or "nothing (keep everything running)")
+
+    def option_args(self):
+        args = ["--keep", str(int(self.keep_spin.get_value()))]
+        if self.pause_services:
+            for s in self.pause_services:
+                args += ["--pause-service", s]
+        else:
+            args.append("--no-pause")
+        ex = [p.strip() for p in self.excl_entry.get_text().split(";") if p.strip()]
+        bad = [p for p in ex if not p.startswith("/")]
+        if bad:
+            self.message(f"Folders to skip must be full paths starting with /: {bad[0]}", error=True)
+            return None
+        if ex:
+            for p in ex:
+                args += ["--exclude", p]
+        else:
+            args.append("--no-exclude")
+        return args
+
+    def on_choose_services(self, *_):
+        svcs = running_services()
+        data = [s for s in svcs if DATA_SVC.search(s)]
+        others = [s for s in svcs if s not in data]
+        dlg = Gtk.Dialog(title="Pause services during backup", transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+        dlg.set_default_size(460, 520)
+        area = dlg.get_content_area()
+        area.set_spacing(6)
+        intro = Gtk.Label(xalign=0)
+        intro.set_line_wrap(True)
+        intro.set_markup("Services that keep databases open should be stopped for the minute or two "
+                         "the copy takes, so their data is saved in a clean state. They are restarted "
+                         "automatically afterwards.")
+        area.pack_start(intro, False, False, 4)
+        sw = Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        lb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, border_width=6)
+        sw.add(lb)
+        area.pack_start(sw, True, True, 0)
+        checks = {}
+        for title, group in (("Likely to hold data", data), ("Other running services", others)):
+            if not group:
+                continue
+            h = Gtk.Label(xalign=0)
+            h.set_markup(f"<b>{title}</b>")
+            lb.pack_start(h, False, False, 4)
+            for s in group:
+                cb = Gtk.CheckButton(label=s.replace(".service", ""))
+                cb.set_active(s in self.pause_services)
+                lb.pack_start(cb, False, False, 0)
+                checks[s] = cb
+        for s in self.pause_services:  # chosen earlier but not running now
+            if s not in checks:
+                cb = Gtk.CheckButton(label=s.replace(".service", "") + " (not running now)")
+                cb.set_active(True)
+                lb.pack_start(cb, False, False, 0)
+                checks[s] = cb
+        dlg.show_all()
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.pause_services = [s for s, cb in checks.items() if cb.get_active()]
+            self.update_pause_label()
+        dlg.destroy()
+
+    def on_add_exclude(self, *_):
+        d = Gtk.FileChooserDialog(title="Folder to skip", transient_for=self,
+                                  action=Gtk.FileChooserAction.SELECT_FOLDER)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Skip this folder", Gtk.ResponseType.OK)
+        if d.run() == Gtk.ResponseType.OK:
+            p = d.get_filename()
+            cur = [x.strip() for x in self.excl_entry.get_text().split(";") if x.strip()]
+            if p and p not in cur:
+                cur.append(p)
+            self.excl_entry.set_text("; ".join(cur))
+        d.destroy()
+
+    # ============================================================ Schedule tab
+    def build_schedule_tab(self):
+        outer = Gtk.Box(spacing=16, border_width=8)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.cal = MonthGrid(self.day_marks, self.show_day)
+        left.pack_start(self.cal, False, False, 0)
+        legend = Gtk.Label(xalign=0)
+        legend.set_markup("<small><span background='#cfeed7' foreground='#14361d'> ✓ backup made </span>   "
+                          "<span background='#d9e6fb' foreground='#13284d'> • backup scheduled </span>   "
+                          "click a day for details</small>")
+        left.pack_start(legend, False, False, 0)
+        self.day_info = Gtk.Label(xalign=0, yalign=0)
+        self.day_info.set_line_wrap(True)
+        self.day_info.set_max_width_chars(40)
+        left.pack_start(self.day_info, False, False, 0)
+        outer.pack_start(left, False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        h = Gtk.Label(xalign=0)
+        h.set_markup("<big><b>Automatic backups</b></big>")
+        right.pack_start(h, False, False, 0)
+
+        self.mode_combo = Gtk.ComboBoxText()
+        for mid, text in (("off", "Off"), ("daily", "Every day"),
+                          ("weekly", "On certain days of the week"), ("monthly", "Once a month")):
+            self.mode_combo.append(mid, text)
+        self.mode_combo.connect("changed", self.on_schedule_changed)
+        r1 = Gtk.Box(spacing=8)
+        r1.pack_start(Gtk.Label(label="Back up"), False, False, 0)
+        r1.pack_start(self.mode_combo, False, False, 0)
+        right.pack_start(r1, False, False, 0)
+
+        self.days_box = Gtk.Box(spacing=4)
+        self.day_toggles = {}
+        for d in DAYS:
+            t = Gtk.ToggleButton(label=d)
+            t.connect("toggled", self.on_schedule_changed)
+            self.day_toggles[d] = t
+            self.days_box.pack_start(t, False, False, 0)
+        right.pack_start(self.days_box, False, False, 0)
+
+        self.dom_box = Gtk.Box(spacing=8)
+        self.dom_box.pack_start(Gtk.Label(label="on day"), False, False, 0)
+        self.dom_spin = Gtk.SpinButton.new_with_range(1, 28, 1)
+        self.dom_spin.connect("value-changed", self.on_schedule_changed)
+        self.dom_box.pack_start(self.dom_spin, False, False, 0)
+        self.dom_box.pack_start(Gtk.Label(label="of each month"), False, False, 0)
+        right.pack_start(self.dom_box, False, False, 0)
+
+        self.time_box = Gtk.Box(spacing=4)
+        self.time_box.pack_start(Gtk.Label(label="at"), False, False, 0)
+        self.hour_combo = Gtk.ComboBoxText()
+        for hh in range(24):
+            self.hour_combo.append(f"{hh:02d}", f"{hh:02d}")
+        self.min_combo = Gtk.ComboBoxText()
+        for mm in ("00", "15", "30", "45"):
+            self.min_combo.append(mm, mm)
+        self.hour_combo.connect("changed", self.on_schedule_changed)
+        self.min_combo.connect("changed", self.on_schedule_changed)
+        self.time_box.pack_start(self.hour_combo, False, False, 0)
+        self.time_box.pack_start(Gtk.Label(label=":"), False, False, 0)
+        self.time_box.pack_start(self.min_combo, False, False, 0)
+        self.time_hint = Gtk.Label(xalign=0)
+        self.time_box.pack_start(self.time_hint, False, False, 8)
+        right.pack_start(self.time_box, False, False, 0)
+
+        self.persist_cb = Gtk.CheckButton(label="If the Pi was off at that time, back up when it next starts")
+        self.verify_cb = Gtk.CheckButton(label="Check each backup after it's made (takes a few extra minutes)")
+        right.pack_start(self.persist_cb, False, False, 0)
+        right.pack_start(self.verify_cb, False, False, 0)
+
+        self.next_lbl = Gtk.Label(xalign=0)
+        self.next_lbl.set_line_wrap(True)
+        right.pack_start(self.next_lbl, False, False, 4)
+        self.last_lbl = Gtk.Label(xalign=0)
+        self.last_lbl.set_line_wrap(True)
+        right.pack_start(self.last_lbl, False, False, 0)
+        note = Gtk.Label(xalign=0)
+        note.set_line_wrap(True)
+        note.set_markup("<small>Scheduled backups use the settings on the <b>Back up</b> tab "
+                        "(services to pause, folders to skip, how many to keep). They run in the "
+                        "background even when nobody is logged in.</small>")
+        right.pack_start(note, False, False, 0)
+        self.sched_save_btn = Gtk.Button(label="Save schedule")
+        self.sched_save_btn.get_style_context().add_class("suggested-action")
+        self.sched_save_btn.connect("clicked", self.on_save_schedule)
+        bb = Gtk.Box()
+        bb.pack_start(self.sched_save_btn, False, False, 0)
+        right.pack_start(bb, False, False, 4)
+        outer.pack_start(right, True, True, 0)
+        return outer
+
+    def load_schedule_into_ui(self):
+        s = self.conf.get("schedule") or {"mode": "off", "time": "02:30", "days": ["Sun"], "dom": 1,
+                                          "persistent": True, "verify": False}
+        self._loading = True
+        self.mode_combo.set_active_id(s.get("mode", "off"))
+        hh, mm = s.get("time", "02:30").split(":")
+        self.hour_combo.set_active_id(f"{int(hh):02d}")
+        self.min_combo.set_active_id(mm if mm in ("00", "15", "30", "45") else "30")
+        for d, t in self.day_toggles.items():
+            t.set_active(d in (s.get("days") or ["Sun"]))
+        self.dom_spin.set_value(int(s.get("dom", 1)))
+        self.persist_cb.set_active(bool(s.get("persistent", True)))
+        self.verify_cb.set_active(bool(s.get("verify", False)))
+        self._loading = False
+        self.on_schedule_changed()
+
+    def ui_schedule(self):
+        return {"mode": self.mode_combo.get_active_id() or "off",
+                "time": f"{self.hour_combo.get_active_id() or '02'}:{self.min_combo.get_active_id() or '30'}",
+                "days": [d for d, t in self.day_toggles.items() if t.get_active()],
+                "dom": int(self.dom_spin.get_value())}
+
+    def on_schedule_changed(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        s = self.ui_schedule()
+        mode = s["mode"]
+        self.days_box.set_visible(mode == "weekly")
+        self.dom_box.set_visible(mode == "monthly")
+        self.time_box.set_visible(mode != "off")
+        for w in (self.persist_cb, self.verify_cb):
+            w.set_sensitive(mode != "off")
+        hh = int(s["time"][:2])
+        self.time_hint.set_markup("<small>(night-time is best: the Pi is usually idle)</small>"
+                                  if 1 <= hh <= 5 else "")
+        runs = next_runs(s)
+        if mode == "off":
+            self.next_lbl.set_markup("Automatic backups are <b>off</b>.")
+        elif not runs:
+            self.next_lbl.set_markup("<b>Pick at least one day.</b>")
+        else:
+            self.next_lbl.set_markup("Next backups: <b>" + "</b>, <b>".join(
+                r.strftime("%a %d %b %H:%M") for r in runs) + "</b>")
+        saved = self.conf.get("schedule") or {"mode": "off"}
+        changed = any(saved.get(k) != s[k] for k in ("mode", "time", "dom")) or \
+            (mode == "weekly" and saved.get("days") != s["days"])
+        self.sched_save_btn.set_label("Save schedule" + (" *" if changed else ""))
+        self.mark_calendar()
+
+    def mark_calendar(self):
+        if hasattr(self, "cal") and hasattr(self, "mode_combo"):
+            self.cal.redraw()
+            self.show_day(self.cal.selected)
+
+    def backups_on(self, day):
+        key = day.strftime("%Y-%m-%d")
+        return [b for b in self.backups if b["name"].startswith(key)]
+
+    def scheduled_on(self, day):
+        s = self.ui_schedule()
+        if day < dt.date.today() or not schedule_matches(s, day):
+            return False
+        hh, mm = (int(x) for x in s["time"].split(":"))
+        return dt.datetime.combine(day, dt.time(hh, mm)) > dt.datetime.now()
+
+    def day_marks(self, day):
+        if not hasattr(self, "mode_combo"):
+            return False, False
+        return bool(self.backups_on(day)), self.scheduled_on(day)
+
+    def show_day(self, d):
+        lines = [f"<b>{d.strftime('%A %d %B %Y')}</b>"]
+        for b in self.backups_on(d):
+            chk = b.get("verified", "not checked yet")
+            lines.append(f"✓ Backup at {b['name'][11:13]}:{b['name'][13:]} — {gb(backup_size(b))}"
+                         f"{' (scheduled)' if b.get('scheduled') else ''}, checked: {chk}")
+        if self.scheduled_on(d):
+            lines.append(f"• Backup scheduled at {self.ui_schedule()['time']}")
+        if len(lines) == 1:
+            lines.append("Nothing on this day.")
+        self.day_info.set_markup("\n".join(lines))
+
+    def on_save_schedule(self, *_):
+        s = self.ui_schedule()
+        if s["mode"] == "weekly" and not s["days"]:
+            self.message("Pick at least one day of the week.", error=True)
+            return
+        opts = self.option_args()
+        if opts is None:
+            return
+        args = ["set-schedule", "--mode", s["mode"], "--time", s["time"],
+                "--days", ",".join(s["days"]), "--dom", str(s["dom"])] + opts
+        if self.persist_cb.get_active():
+            args.append("--persistent")
+        if self.verify_cb.get_active():
+            args.append("--verify")
+        self.run_job(args, "Saving schedule…")
+
+    # ============================================================ Restore tab
+    def build_restore_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, border_width=8)
+        f1 = Gtk.Frame(label=" Get files or folders back ")
+        g = Gtk.Grid(column_spacing=8, row_spacing=6, border_width=8)
+        f1.add(g)
+        g.attach(Gtk.Label(label="From backup", xalign=0), 0, 0, 1, 1)
+        self.files_combo = Gtk.ComboBoxText()
+        g.attach(self.files_combo, 1, 0, 1, 1)
+        g.attach(Gtk.Label(label="Path(s)", xalign=0), 0, 1, 1, 1)
+        self.path_entry = Gtk.Entry()
+        self.path_entry.set_hexpand(True)
+        self.path_entry.set_text(os.path.expanduser("~"))
+        self.path_entry.set_tooltip_text("Full path of a file or folder as it was on the Pi. Separate several with ;")
+        g.attach(self.path_entry, 1, 1, 1, 1)
+        note = Gtk.Label(xalign=0)
+        note.set_line_wrap(True)
+        note.set_markup("<small>Copies go into <b>~/Restored/&lt;backup&gt;/</b> with their original "
+                        "folders. Nothing on your system is overwritten.</small>")
+        g.attach(note, 0, 2, 2, 1)
+        self.files_btn = Gtk.Button(label="Restore to ~/Restored")
+        self.files_btn.connect("clicked", self.on_restore_files)
+        g.attach(self.files_btn, 1, 3, 1, 1)
+        box.pack_start(f1, False, False, 0)
+
+        f2 = Gtk.Frame(label=" Rebuild a whole system onto a drive ")
+        g2 = Gtk.Grid(column_spacing=8, row_spacing=6, border_width=8)
+        f2.add(g2)
+        self.rebuild_note = Gtk.Label(xalign=0)
+        self.rebuild_note.set_line_wrap(True)
+        g2.attach(self.rebuild_note, 0, 0, 2, 1)
+        self.sys_combo = Gtk.ComboBoxText()
+        self.sys_combo.connect("changed", self.on_rebuild_mode)
+        self.rmode_combo = Gtk.ComboBoxText()
+        self.rmode_combo.append("standard", "Single drive (standard Pi layout: boot + system)")
+        self.rmode_combo.append("raid", "RAID1 mirror (two drives, boot stays on the SD card)")
+        self.rmode_combo.set_active_id("standard")
+        self.rmode_combo.connect("changed", self.on_rebuild_mode)
+        self.disk1 = Gtk.ComboBoxText()
+        self.disk2 = Gtk.ComboBoxText()
+        self.bootp = Gtk.ComboBoxText()
+        rows = [("From backup", self.sys_combo), ("Rebuild as", self.rmode_combo), ("Drive", self.disk1),
+                ("Second drive", self.disk2), ("Boot partition", self.bootp)]
+        self.rebuild_labels = {}
+        for i, (lab, w) in enumerate(rows):
+            lw = Gtk.Label(label=lab, xalign=0)
+            self.rebuild_labels[w] = lw
+            g2.attach(lw, 0, i + 1, 1, 1)
+            w.set_hexpand(True)
+            g2.attach(w, 1, i + 1, 1, 1)
+        rescan = Gtk.Button(label="Rescan drives")
+        rescan.connect("clicked", lambda *_: self.refresh_disks())
+        g2.attach(rescan, 0, 6, 1, 1)
+        self.rebuild_btn = Gtk.Button(label="Rebuild system…")
+        self.rebuild_btn.get_style_context().add_class("destructive-action")
+        self.rebuild_btn.connect("clicked", self.on_rebuild)
+        g2.attach(self.rebuild_btn, 1, 6, 1, 1)
+        box.pack_start(f2, False, False, 0)
+        return box
+
+    def on_rebuild_mode(self, *_):
+        n = self.sys_combo.get_active_id()
+        m = next((b for b in self.backups if b["name"] == n), None)
+        has_md = bool(m and m.get("md"))
+        if not has_md and self.rmode_combo.get_active_id() == "raid":
+            self.rmode_combo.set_active_id("standard")
+        raid = self.rmode_combo.get_active_id() == "raid"
+        for w in (self.disk2, self.bootp):
+            w.set_visible(raid)
+            self.rebuild_labels[w].set_visible(raid)
+        self.rebuild_labels[self.disk1].set_text("First drive" if raid else "Drive")
+        if raid:
+            txt = ("Recreates the RAID1 mirror with the original IDs and copies the system back. Only "
+                   "restore the boot partition if it's damaged or the SD card was replaced.")
+        else:
+            txt = ("Creates a boot partition and a system partition on the drive, copies the backup "
+                   "onto them and points the startup settings at the new drive. Use it to recover "
+                   "onto a new SD card or SSD, or to move your system to a bigger drive.")
+        self.rebuild_note.set_markup(f"<small>{txt} <b>Everything on the chosen drive is erased.</b> "
+                                     "Drives the Pi is running from can't be chosen.</small>")
+
+    # ============================================================ Location tab (disk manager)
+    def build_location_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, border_width=8)
+        self.loc_lbl = Gtk.Label(xalign=0)
+        self.loc_lbl.set_line_wrap(True)
+        box.pack_start(self.loc_lbl, False, False, 0)
+
+        # path, name, size, fs, label, mount, pct, used_text, role, can_use, can_format, uuid, fstype, why, tran
+        self.dstore = Gtk.TreeStore(str, str, str, str, str, str, int, str, str, bool, bool, str, str, str, str)
+        tv = Gtk.TreeView(model=self.dstore)
+        cols = [("Drive / partition", 1, 230), ("Size", 2, 70), ("Format · name", 3, 120), ("Mounted at", 5, 120)]
+        for title, idx, width in cols:
+            r = Gtk.CellRendererText()
+            r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=idx)
+            c.set_resizable(True)
+            c.set_min_width(width)
+            tv.append_column(c)
+        pr = Gtk.CellRendererProgress()
+        c = Gtk.TreeViewColumn("Used", pr, value=6, text=7)
+        c.set_min_width(110)
+        tv.append_column(c)
+        r = Gtk.CellRendererText()
+        r.set_property("ellipsize", Pango.EllipsizeMode.END)
+        c = Gtk.TreeViewColumn("What it is", r, text=8)
+        c.set_expand(True)
+        tv.append_column(c)
+        tv.get_selection().connect("changed", self.on_disk_selected)
+        self.dtree = tv
+        sw = Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+
+        self.disk_info = Gtk.Label(xalign=0)
+        self.disk_info.set_line_wrap(True)
+        box.pack_start(self.disk_info, False, False, 0)
+        btns = Gtk.Box(spacing=8)
+        self.use_btn = Gtk.Button(label="Use for backups")
+        self.use_btn.get_style_context().add_class("suggested-action")
+        self.use_btn.connect("clicked", self.on_use_location)
+        self.format_btn = Gtk.Button(label="Erase and make a backup drive…")
+        self.format_btn.get_style_context().add_class("destructive-action")
+        self.format_btn.connect("clicked", self.on_format_location)
+        rb = Gtk.Button(label="Refresh")
+        rb.connect("clicked", lambda *_: self.refresh_location_tab())
+        btns.pack_start(self.use_btn, False, False, 0)
+        btns.pack_start(self.format_btn, False, False, 0)
+        btns.pack_end(rb, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+        tip = Gtk.Label(xalign=0)
+        tip.set_line_wrap(True)
+        tip.set_markup("<small>Best choice: a separate USB drive or SSD, so a failure of the drive your "
+                       "system runs from doesn't take the backups with it. Plug it in and press Refresh.</small>")
+        box.pack_start(tip, False, False, 0)
+        return box
+
+    def refresh_location_tab(self):
+        self.conf = read_conf()
+        loc_uuid = (self.conf.get("location") or {}).get("uuid")
+        self.dstore.clear()
+        for top in block_devices():
+            if top.get("type") != "disk" or top["name"].startswith(("zram", "loop", "ram")):
+                continue
+            nodes = list(walk(top))
+            disk_system = any(m in SYSTEM_MOUNTS for n in nodes for m in mounts_of(n))
+            raid_members = {n["path"] for n in nodes if n.get("fstype") == "linux_raid_member"}
+            tran = (top.get("tran") or "").lower()
+            kind = {"usb": "USB", "nvme": "NVMe", "mmc": "SD card", "sata": "SATA"}.get(tran, tran.upper())
+            name = f"{top['path']}  {top.get('model') or kind}".strip()
+            roles = []
+            if disk_system:
+                roles.append("drive your system runs from")
+            elif top.get("rm") or tran == "usb":
+                roles.append(f"removable {kind}".strip())
+            if loc_uuid and any(n.get("uuid") == loc_uuid for n in nodes):
+                roles.append("holds your backups")
+            can_format = not disk_system and not raid_members
+            why = ("This drive holds your running system, so it can't be erased." if disk_system else
+                   "This drive is part of a RAID array." if raid_members else "")
+            it = self.dstore.append(None, [top["path"], name, gb(int(top["size"])), "", "", "",
+                                           0, "", ", ".join(roles), False, can_format, "", "", why, tran])
+            children = [c for c in (top.get("children") or []) if c.get("type") == "part"]
+            if not children and top.get("fstype"):
+                children = []  # filesystem directly on the disk is handled below
+                self.add_part_row(it, top, loc_uuid, disk_system, kind, whole=True)
+            for p in children:
+                self.add_part_row(it, p, loc_uuid, disk_system, kind)
+        self.dtree.expand_all()
+        loc = self.conf.get("location")
+        if loc:
+            mounted = location_mounted(self.conf)
+            extra = ""
+            if mounted:
+                u = disk_usage(store_dir(self.conf))
+                extra = f" — {gb(u.free)} free"
+            folder = f", folder “{loc['subdir']}”" if loc.get("subdir") else ""
+            self.loc_lbl.set_markup(f"Backups are stored on <b>{GLib.markup_escape_text(loc['desc'])}</b>"
+                                    f"{GLib.markup_escape_text(folder)}{extra}"
+                                    + ("" if mounted else "  <b>(not connected)</b>"))
+        else:
+            self.loc_lbl.set_markup("<b>No backup location yet.</b> Pick a drive or partition below.")
+        self.on_disk_selected()
+
+    def add_part_row(self, parent, p, loc_uuid, disk_system, kind, whole=False):
+        mps = mounts_of(p)
+        fs = p.get("fstype") or ""
+        system = any(m in SYSTEM_MOUNTS for m in mps)
+        raid = fs == "linux_raid_member"
+        roles = []
+        if "/" in mps:
+            roles.append("your system")
+        elif "/boot/firmware" in mps or "/boot" in mps:
+            roles.append("boot partition")
+        elif "[SWAP]" in mps:
+            roles.append("swap")
+        if raid:
+            md = [c for c in (p.get("children") or []) if (c.get("type") or "").startswith("raid")]
+            where = mounts_of(md[0]) if md else []
+            roles.append(f"RAID member{(' of ' + md[0]['name']) if md else ''}"
+                         f"{(' (' + where[0] + ')') if where else ''}")
+        if loc_uuid and p.get("uuid") == loc_uuid:
+            roles.append("★ backup location")
+        if not fs:
+            roles.append("empty / unformatted")
+        can_use = fs in USABLE_FS and not system and not raid and p.get("uuid") != loc_uuid
+        why = ""
+        if system:
+            why = "This partition is part of the running system."
+        elif raid:
+            why = "This partition belongs to a RAID array."
+        elif fs and fs not in USABLE_FS:
+            why = f"'{fs}' can't hold backups; erase it to use it."
+        elif not fs:
+            why = "Not formatted; erase it to make a backup drive."
+        elif p.get("uuid") == loc_uuid:
+            why = "This is already your backup location."
+        if can_use and disk_system:
+            roles.append("same drive as your system")
+        pct, used_text = 0, ""
+        if p.get("fssize") and p.get("fsused") is not None:
+            size, used = int(p["fssize"]), int(p["fsused"])
+            pct = int(100 * used / size) if size else 0
+            used_text = f"{gb(used)} ({pct}%)"
+        can_format = not system and not raid and not (whole and disk_system)
+        self.dstore.append(parent, [p["path"], p["path"] if not whole else f"{p['path']} (whole drive)",
+                                    gb(int(p["size"])), " · ".join(x for x in (fs, p.get("label")) if x),
+                                    p.get("label") or "", ", ".join(mps),
+                                    pct, used_text, ", ".join(roles), can_use, can_format,
+                                    p.get("uuid") or "", fs, why, kind])
+
+    def selected_disk_row(self):
+        model, it = self.dtree.get_selection().get_selected()
+        return model[it] if it else None
+
+    def on_disk_selected(self, *_):
+        r = self.selected_disk_row()
+        if not r:
+            self.use_btn.set_sensitive(False)
+            self.format_btn.set_sensitive(False)
+            self.disk_info.set_markup("<small>Select a drive or partition.</small>")
+            return
+        path, can_use, can_format, fs, why = r[0], r[9], r[10], r[12], r[13]
+        busy = self.proc is not None
+        self.use_btn.set_sensitive(can_use and not busy)
+        self.format_btn.set_sensitive(can_format and not busy)
+        notes = []
+        if can_use:
+            notes.append(f"<b>Use for backups</b> keeps everything already on {path} and adds a "
+                         "<tt>pi-backups</tt> folder.")
+            if fs in SHARED_FS:
+                notes.append(f"⚠ {fs} can't keep file permissions: anyone who plugs this drive into "
+                             "another computer can read the backups (they include password hashes "
+                             "and keys). Erasing it as a backup drive (ext4) avoids that.")
+            if "same drive as your system" in r[8]:
+                notes.append("⚠ This partition is on the same drive as your system; if that drive "
+                             "fails you lose the backups too.")
+        if can_format:
+            notes.append(f"<b>Erase</b> wipes {path} and formats it as a dedicated ext4 backup drive.")
+        if why:
+            notes.append(why)
+        self.disk_info.set_markup("<small>" + "\n".join(notes) + "</small>")
+
+    def on_use_location(self, *_):
+        r = self.selected_disk_row()
+        if not r or not r[9]:
+            return
+        label = r[4]
+        subdir = "" if label == "PIBACKUP" else "pi-backups"
+        where = "its top folder" if not subdir else f"a “{subdir}” folder"
+        if not self.confirm(f"Store backups on {r[0]}?",
+                            f"Backups will go into {where}. Files already on the drive are not touched."):
+            return
+        self.run_job(["set-location", "--uuid", r[11], "--subdir", subdir], "Setting backup location…")
+
+    def on_format_location(self, *_):
+        r = self.selected_disk_row()
+        if not r or not r[10]:
+            return
+        if not self.ask_erase("Erase and make a backup drive?",
+                              f"Everything on {r[0]} ({r[2]}) will be erased and it will be formatted "
+                              "as a backup drive called PIBACKUP."):
+            return
+        self.run_job(["format-location", r[0], "--confirm", "ERASE"], f"Preparing {r[0]}…", cancellable=False)
+
+    # ============================================================ refresh
+    def refresh(self):
+        self.conf = read_conf()
+        loc = self.conf.get("location")
+        mounted = location_mounted(self.conf)
+        self.backups = read_backups(self.conf) if mounted else []
+        if not loc:
+            self.status.set_markup("<b>Choose where to keep backups first</b> on the "
+                                   "<b>Backup location</b> tab.")
+        elif not mounted:
+            self.status.set_markup(f"<b>The backup drive isn't connected</b> "
+                                   f"({GLib.markup_escape_text(loc['desc'])}).")
+        else:
+            u = disk_usage(store_dir(self.conf))
+            fits = ""
+            if self.backups:
+                per = backup_size(self.backups[0])
+                if per:
+                    fits = f" — room for about {int(u.free // per)} more"
+            self.status.set_markup(f"Backups on <b>{GLib.markup_escape_text(loc['desc'])}</b>: "
+                                   f"<b>{gb(u.free)} free</b>{fits}")
+        self.mount_btn.set_visible(bool(loc) and not mounted)
+        last = last_scheduled()
+        if last:
+            icon = "✓" if last.get("ok") else "✗"
+            self.last_lbl.set_markup(f"Last scheduled backup: <b>{icon} {last.get('time', '')}</b> — "
+                                     f"{GLib.markup_escape_text(last.get('message', ''))}")
+        else:
+            self.last_lbl.set_text("")
+
+        self.store.clear()
+        for c in (self.files_combo, self.sys_combo):
+            c.remove_all()
+        for m in self.backups:
+            notes = []
+            if m.get("scheduled"):
+                notes.append("scheduled")
+            if m.get("md"):
+                notes.append("RAID1 system")
+            if m.get("model"):
+                notes.append(m["model"])
+            self.store.append([m["name"], m.get("created", ""), gb(backup_size(m)),
+                               m.get("verified", "not yet"), ", ".join(notes)])
+            self.files_combo.append(m["name"], m["name"])
+            self.sys_combo.append(m["name"], m["name"])
+        if self.backups:
+            self.files_combo.set_active(0)
+            self.sys_combo.set_active(0)
+        self.refresh_disks()
+        self.refresh_location_tab()
+        self.mark_calendar()
+        self.on_rebuild_mode()
+
+    def refresh_disks(self):
+        loc_uuid = (self.conf.get("location") or {}).get("uuid")
+        for c in (self.disk1, self.disk2, self.bootp):
+            c.remove_all()
+        self.disk2.append("", "(none: start the mirror with one drive)")
+        self.bootp.append("", "Leave the boot partition alone")
+        for top in block_devices():
+            if top.get("type") != "disk" or top["name"].startswith(("zram", "loop", "ram")):
+                continue
+            nodes = list(walk(top))
+            busy = any(not (m.startswith("/media/") or m.startswith("/run/media/"))
+                       for n in nodes for m in mounts_of(n))
+            if loc_uuid and any(n.get("uuid") == loc_uuid for n in nodes):
+                continue
+            desc = f"{top['path']} — {gb(int(top['size']))} {top.get('model') or top.get('tran') or ''}".strip()
+            if not busy:
+                self.disk1.append(top["path"], desc)
+                self.disk2.append(top["path"], desc)
+            for n in nodes:
+                if n.get("type") == "part" and n.get("fstype") == "vfat" and not mounts_of(n):
+                    self.bootp.append(n["path"], f"{n['path']} ({gb(int(n['size']))} FAT)")
+        self.disk1.set_active(0)
+        self.disk2.set_active(0)
+        self.bootp.set_active(0)
+        has = self.disk1.get_active_id() is not None
+        self.rebuild_btn.set_sensitive(has and self.proc is None)
+        if not has:
+            self.disk1.append("", "(no free drive: every drive is in use or holds the backups)")
+            self.disk1.set_active(0)
+
+    def selected_backup(self):
+        model, it = self.tree.get_selection().get_selected()
+        if it is None:
+            self.message("Select a backup in the list first.")
+            return None
+        return model[it][0]
+
+    # ============================================================ actions
+    def on_backup(self, *_):
+        opts = self.option_args()
+        if opts is not None:
+            self.run_job(["backup", "--save-options"] + opts, "Starting backup…")
+
+    def on_verify(self, *_):
+        n = self.selected_backup()
+        if n:
+            self.run_job(["verify", n], f"Checking {n}…")
+
+    def on_delete(self, *_):
+        n = self.selected_backup()
+        if n and self.confirm(f"Delete backup {n}?", "This can't be undone."):
+            self.run_job(["delete", n], f"Deleting {n}…")
+
+    def on_restore_files(self, *_):
+        n = self.files_combo.get_active_id()
+        paths = [p.strip() for p in self.path_entry.get_text().split(";") if p.strip()]
+        if not n or not paths:
+            self.message("Choose a backup and enter at least one path.")
+            return
+        dest = os.path.join(os.path.expanduser("~"), "Restored", n)
+        self.after_job = lambda ok: ok and subprocess.Popen(["xdg-open", dest])
+        self.run_job(["restore-files", n, "--dest", dest] + paths, "Restoring files…")
+
+    def on_rebuild(self, *_):
+        n = self.sys_combo.get_active_id()
+        mode = self.rmode_combo.get_active_id()
+        d1 = self.disk1.get_active_id()
+        d2 = self.disk2.get_active_id() if mode == "raid" else ""
+        bp = self.bootp.get_active_id() if mode == "raid" else ""
+        if not n or not d1:
+            self.message("Choose a backup and a drive.")
+            return
+        if d2 and d2 == d1:
+            self.message("The two drives must be different.")
+            return
+        drives = [d for d in (d1, d2) if d]
+        text = (f"Everything on {' and '.join(drives)} will be erased and replaced with backup {n}."
+                + (f" The boot files on {bp} will also be replaced." if bp else ""))
+        if not self.ask_erase("Erase and rebuild?", text):
+            return
+        args = ["restore-system", n, "--mode", mode, "--confirm", "ERASE"]
+        for d in drives:
+            args += ["--disk", d]
+        if bp:
+            args += ["--boot-part", bp]
+        self.run_job(args, "Rebuilding system…", cancellable=False)
+
+    # ============================================================ job runner
+    def run_job(self, args, start_text, cancellable=True):
+        if self.proc:
+            return
+        cmd = ([HELPER] if os.geteuid() == 0 else ["pkexec", HELPER]) + ["--watch-stdin"] + args
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except FileNotFoundError as e:
+            self.message(f"Couldn't start the helper: {e}", error=True)
+            return
+        self.got_done = False
+        self.bar.set_fraction(0)
+        self.bar.set_text(start_text)
+        self.append_log(f"$ {' '.join(args)}")
+        for w in self.action_widgets:
+            w.set_sensitive(False)
+        self.cancel_btn.set_sensitive(cancellable)
+        threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+
+    def reader(self, p):
+        for line in p.stdout:
+            GLib.idle_add(self.handle_line, line.rstrip("\n"))
+        rc = p.wait()
+        GLib.idle_add(self.job_finished, rc)
+
+    def handle_line(self, line):
+        kind, _, rest = line.partition(" ")
+        if kind == "PROGRESS":
+            pct, _, text = rest.partition(" ")
+            try:
+                self.bar.set_fraction(float(pct) / 100)
+            except ValueError:
+                pass
+            self.bar.set_text(text)
+        elif kind == "LOG":
+            self.append_log(rest)
+        elif kind == "DONE":
+            status, _, msg = rest.partition(" ")
+            self.got_done = True
+            self.last_ok = status == "ok"
+            self.append_log(msg)
+            self.bar.set_text("Finished" if self.last_ok else "Failed")
+            if self.last_ok:
+                self.bar.set_fraction(1)
+            self.message(msg, error=not self.last_ok)
+        else:
+            self.append_log(line)
+        return False
+
+    def job_finished(self, rc):
+        self.proc = None
+        if not self.got_done:
+            self.last_ok = False
+            text = ("Authorisation was cancelled." if rc in (126, 127)
+                    else f"The helper stopped unexpectedly (code {rc}).")
+            self.bar.set_text(text)
+            self.append_log(text)
+        for w in self.action_widgets:
+            w.set_sensitive(True)
+        self.cancel_btn.set_sensitive(False)
+        cb, self.after_job = self.after_job, None
+        if cb:
+            cb(self.last_ok)
+        self.refresh()
+        self.load_schedule_into_ui()
+        return False
+
+    def on_cancel(self, *_):
+        if self.proc and self.proc.stdin:
+            self.bar.set_text("Cancelling…")
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+
+    def on_close(self, *_):
+        if self.proc:
+            if not self.confirm("A job is still running.", "Closing cancels it. Close anyway?"):
+                return True
+            self.on_cancel()
+        return False
+
+    # ============================================================ dialogs
+    def append_log(self, text):
+        buf = self.logview.get_buffer()
+        buf.insert(buf.get_end_iter(), text + "\n")
+        self.logview.scroll_to_iter(buf.get_end_iter(), 0, False, 0, 0)
+
+    def message(self, text, error=False):
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK, text=text)
+        d.run()
+        d.destroy()
+
+    def confirm(self, title, text):
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.YES_NO, text=title)
+        d.format_secondary_text(text)
+        r = d.run()
+        d.destroy()
+        return r == Gtk.ResponseType.YES
+
+    def ask_erase(self, title, text):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK_CANCEL, text=title)
+        dlg.format_secondary_text(text + "\n\nType ERASE to continue.")
+        entry = Gtk.Entry()
+        dlg.get_message_area().pack_start(entry, False, False, 0)
+        ok = dlg.get_widget_for_response(Gtk.ResponseType.OK)
+        ok.set_sensitive(False)
+        entry.connect("changed", lambda e: ok.set_sensitive(e.get_text() == "ERASE"))
+        dlg.show_all()
+        resp = dlg.run()
+        typed = entry.get_text()
+        dlg.destroy()
+        return resp == Gtk.ResponseType.OK and typed == "ERASE"
+
+
+def main():
+    prov = Gtk.CssProvider()
+    prov.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win = App()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    win.load_schedule_into_ui()   # re-apply visibility after show_all
+    win.on_rebuild_mode()
+    conf = read_conf()
+    win.mount_btn.set_visible(bool(conf.get("location")) and not location_mounted(conf))
+    if not conf.get("location"):
+        win.nb.set_current_page(3)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
