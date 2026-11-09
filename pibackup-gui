@@ -927,45 +927,79 @@ class App(Gtk.Window):
         model, it = self.dtree.get_selection().get_selected()
         return model[it] if it else None
 
+    def use_target(self):
+        """The row 'Use for backups' acts on: the selected partition, or a drive's only usable partition.
+        Returns (row, note)."""
+        model, it = self.dtree.get_selection().get_selected()
+        if not it:
+            return None, ""
+        r = model[it]
+        if r[9]:
+            return r, ""
+        kids = []
+        c = model.iter_children(it)
+        while c:
+            kids.append(model[c])
+            c = model.iter_next(c)
+        usable = [k for k in kids if k[9]]
+        if len(usable) == 1:
+            return usable[0], f"<b>Use for backups</b> will use {usable[0][0]}, the usable partition on this drive."
+        if len(usable) > 1:
+            return None, ("This drive has several partitions that could hold backups; select the one "
+                          "you want in the list.")
+        if kids and not r[13]:
+            return None, "None of this drive's partitions can be used as they are; see each partition for why."
+        return None, ""
+
     def on_disk_selected(self, *_):
         r = self.selected_disk_row()
         if not r:
             self.use_btn.set_sensitive(False)
             self.format_btn.set_sensitive(False)
-            self.disk_info.set_markup("<small>Select a drive or partition.</small>")
+            self.disk_info.set_markup("<small>Select a partition (the indented rows) to store backups on it, "
+                                      "or a whole drive to erase it as a backup drive.</small>")
             return
-        path, can_use, can_format, fs, why = r[0], r[9], r[10], r[12], r[13]
+        target, target_note = self.use_target()
         busy = self.proc is not None
-        self.use_btn.set_sensitive(can_use and not busy)
-        self.format_btn.set_sensitive(can_format and not busy)
+        self.use_btn.set_sensitive(target is not None and not busy)
+        self.format_btn.set_sensitive(r[10] and not busy)
         notes = []
-        if can_use:
-            notes.append(f"<b>Use for backups</b> keeps everything already on {path} and adds a "
-                         "<tt>pi-backups</tt> folder.")
+        if target_note:
+            notes.append(target_note)
+        if target is not None:
+            fs = target[12]
+            if not target_note:
+                if target[4] == "PIBACKUP":
+                    notes.append(f"<b>Use for backups</b> keeps everything already on {target[0]}; it's labelled "
+                                 "PIBACKUP, so backups go in its top folder.")
+                else:
+                    notes.append(f"<b>Use for backups</b> keeps everything already on {target[0]} and adds a "
+                                 "<tt>pi-backups</tt> folder.")
             if fs in SHARED_FS:
                 notes.append(f"⚠ {fs} can't keep file permissions: anyone who plugs this drive into "
                              "another computer can read the backups (they include password hashes "
                              "and keys). Erasing it as a backup drive (ext4) avoids that.")
-            if "same drive as your system" in r[8]:
+            if "same drive as your system" in target[8]:
                 notes.append("⚠ This partition is on the same drive as your system; if that drive "
                              "fails you lose the backups too.")
-        if can_format:
-            notes.append(f"<b>Erase</b> wipes {path} and formats it as a dedicated ext4 backup drive.")
-        if why:
-            notes.append(why)
+        if r[10]:
+            notes.append(f"<b>Erase</b> wipes {r[0]} and formats it as a dedicated ext4 backup drive.")
+        if r[13] and target is None:
+            notes.append(r[13])
+        if busy:
+            notes.append("Wait for the current job to finish.")
         self.disk_info.set_markup("<small>" + "\n".join(notes) + "</small>")
 
     def on_use_location(self, *_):
-        r = self.selected_disk_row()
-        if not r or not r[9]:
+        target, _note = self.use_target()
+        if not target:
             return
-        label = r[4]
-        subdir = "" if label == "PIBACKUP" else "pi-backups"
+        subdir = "" if target[4] == "PIBACKUP" else "pi-backups"
         where = "its top folder" if not subdir else f"a “{subdir}” folder"
-        if not self.confirm(f"Store backups on {r[0]}?",
-                            f"Backups will go into {where}. Files already on the drive are not touched."):
+        if not self.confirm(f"Store backups on {target[0]}?",
+                            f"Backups will go into {where}. Files already on the partition are not touched."):
             return
-        self.run_job(["set-location", "--uuid", r[11], "--subdir", subdir], "Setting backup location…")
+        self.run_job(["set-location", "--uuid", target[11], "--subdir", subdir], "Setting backup location…")
 
     def on_format_location(self, *_):
         r = self.selected_disk_row()
