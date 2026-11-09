@@ -14,7 +14,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
@@ -116,6 +116,26 @@ def mounts_of(n):
 
 def backup_size(m):
     return sum(f.get("bytes", 0) for f in m.get("files", {}).values())
+
+
+PREFS = os.path.expanduser("~/.config/pibackup-gui.json")
+
+
+def load_prefs():
+    try:
+        with open(PREFS) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_prefs(p):
+    try:
+        os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+        with open(PREFS, "w") as f:
+            json.dump(p, f)
+    except OSError:
+        pass
 
 
 def fmt12(hhmm):
@@ -259,6 +279,8 @@ class App(Gtk.Window):
         self.last_ok = False
         self.quiet_done = False
         self.scan_results = []
+        self.prefs = load_prefs()
+        self.use24 = bool(self.prefs.get("clock24", False))
         self.conf = read_conf()
         self.backups = []
 
@@ -565,8 +587,6 @@ class App(Gtk.Window):
         self.time_box = Gtk.Box(spacing=4)
         self.time_box.pack_start(Gtk.Label(label="at"), False, False, 0)
         self.hour_combo = Gtk.ComboBoxText()
-        for h in range(1, 13):
-            self.hour_combo.append(str(h), str(h))
         self.min_combo = Gtk.ComboBoxText()
         for mm in ("00", "15", "30", "45"):
             self.min_combo.append(mm, mm)
@@ -579,6 +599,12 @@ class App(Gtk.Window):
         self.time_box.pack_start(Gtk.Label(label=":"), False, False, 0)
         self.time_box.pack_start(self.min_combo, False, False, 0)
         self.time_box.pack_start(self.ampm_combo, False, False, 4)
+        self.clock24_cb = Gtk.CheckButton(label="24-hour")
+        self.clock24_cb.set_tooltip_text("Show times as 14:30 instead of 2:30 PM")
+        self.clock24_cb.set_active(self.use24)
+        self.clock24_cb.connect("toggled", self.on_clock_toggled)
+        self.time_box.pack_start(self.clock24_cb, False, False, 8)
+        self.fill_hours()
         self.time_hint = Gtk.Label(xalign=0)
         self.time_box.pack_start(self.time_hint, False, False, 8)
         right.pack_start(self.time_box, False, False, 0)
@@ -615,9 +641,7 @@ class App(Gtk.Window):
         self._loading = True
         self.mode_combo.set_active_id(s.get("mode", "off"))
         hh, mm = s.get("time", "02:30").split(":")
-        h24 = int(hh)
-        self.hour_combo.set_active_id(str(h24 % 12 or 12))
-        self.ampm_combo.set_active_id("AM" if h24 < 12 else "PM")
+        self.set_ui_time(int(hh))
         self.min_combo.set_active_id(mm if mm in ("00", "15", "30", "45") else "30")
         for d, t in self.day_toggles.items():
             t.set_active(d in (s.get("days") or ["Sun"]))
@@ -627,11 +651,50 @@ class App(Gtk.Window):
         self._loading = False
         self.on_schedule_changed()
 
-    def ui_time24(self):
-        h12 = int(self.hour_combo.get_active_id() or 2)
+    def fill_hours(self):
+        self.hour_combo.remove_all()
+        if self.use24:
+            for h in range(24):
+                self.hour_combo.append(f"{h:02d}", f"{h:02d}")
+        else:
+            for h in range(1, 13):
+                self.hour_combo.append(str(h), str(h))
+        self.ampm_combo.set_visible(not self.use24)
+        self.ampm_combo.set_no_show_all(self.use24)
+
+    def set_ui_time(self, h24):
+        if self.use24:
+            self.hour_combo.set_active_id(f"{h24:02d}")
+        else:
+            self.hour_combo.set_active_id(str(h24 % 12 or 12))
+            self.ampm_combo.set_active_id("AM" if h24 < 12 else "PM")
+
+    def ui_hour24(self):
+        hid = self.hour_combo.get_active_id()
+        if hid is None:
+            return 2
+        if self.use24:
+            return int(hid)
         pm = (self.ampm_combo.get_active_id() or "AM") == "PM"
-        h24 = (h12 % 12) + (12 if pm else 0)
-        return f"{h24:02d}:{self.min_combo.get_active_id() or '30'}"
+        return (int(hid) % 12) + (12 if pm else 0)
+
+    def ui_time24(self):
+        return f"{self.ui_hour24():02d}:{self.min_combo.get_active_id() or '30'}"
+
+    def on_clock_toggled(self, cb):
+        h24 = self.ui_hour24()
+        self._loading = True
+        self.use24 = cb.get_active()
+        self.fill_hours()
+        self.set_ui_time(h24)
+        self._loading = False
+        self.prefs["clock24"] = self.use24
+        save_prefs(self.prefs)
+        self.on_schedule_changed()
+        self.refresh_last_label()
+
+    def fmt_time(self, hhmm):
+        return hhmm if self.use24 else fmt12(hhmm)
 
     def ui_schedule(self):
         return {"mode": self.mode_combo.get_active_id() or "off",
@@ -659,7 +722,7 @@ class App(Gtk.Window):
             self.next_lbl.set_markup("<b>Pick at least one day.</b>")
         else:
             self.next_lbl.set_markup("Next backups: <b>" + "</b>, <b>".join(
-                f"{r.strftime('%a %d %b')} {fmt12(r.strftime('%H:%M'))}" for r in runs) + "</b>")
+                f"{r.strftime('%a %d %b')} {self.fmt_time(r.strftime('%H:%M'))}" for r in runs) + "</b>")
         saved = self.conf.get("schedule") or {"mode": "off"}
         changed = any(saved.get(k) != s[k] for k in ("mode", "time", "dom")) or \
             (mode == "weekly" and saved.get("days") != s["days"])
@@ -691,10 +754,10 @@ class App(Gtk.Window):
         lines = [f"<b>{d.strftime('%A %d %B %Y')}</b>"]
         for b in self.backups_on(d):
             chk = b.get("verified", "not checked yet")
-            lines.append(f"✓ Backup at {fmt12(b['name'][11:13] + ':' + b['name'][13:])} — {gb(backup_size(b))}"
+            lines.append(f"✓ Backup at {self.fmt_time(b['name'][11:13] + ':' + b['name'][13:])} — {gb(backup_size(b))}"
                          f"{' (scheduled)' if b.get('scheduled') else ''}, checked: {chk}")
         if self.scheduled_on(d):
-            lines.append(f"• Backup scheduled at {fmt12(self.ui_schedule()['time'])}")
+            lines.append(f"• Backup scheduled at {self.fmt_time(self.ui_schedule()['time'])}")
         if len(lines) == 1:
             lines.append("Nothing on this day.")
         self.day_info.set_markup("\n".join(lines))
@@ -1057,16 +1120,7 @@ class App(Gtk.Window):
             self.status.set_markup(f"Backups on <b>{GLib.markup_escape_text(loc['desc'])}</b>: "
                                    f"<b>{gb(u.free)} free</b>{fits}")
         self.mount_btn.set_visible(bool(loc) and not mounted)
-        last = last_scheduled()
-        if last:
-            icon = "✓" if last.get("ok") else "✗"
-            t = last.get("time", "")
-            if re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d$", t):
-                t = dt.datetime.strptime(t, "%Y-%m-%d %H:%M").strftime("%a %d %b ") + fmt12(t[11:])
-            self.last_lbl.set_markup(f"Last scheduled backup: <b>{icon} {t}</b> — "
-                                     f"{GLib.markup_escape_text(last.get('message', ''))}")
-        else:
-            self.last_lbl.set_text("")
+        self.refresh_last_label()
 
         self.store.clear()
         for c in (self.files_combo, self.sys_combo):
@@ -1090,6 +1144,18 @@ class App(Gtk.Window):
         self.refresh_location_tab()
         self.mark_calendar()
         self.on_rebuild_mode()
+
+    def refresh_last_label(self):
+        last = last_scheduled()
+        if last:
+            icon = "✓" if last.get("ok") else "✗"
+            t = last.get("time", "")
+            if re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d$", t):
+                t = dt.datetime.strptime(t, "%Y-%m-%d %H:%M").strftime("%a %d %b ") + self.fmt_time(t[11:])
+            self.last_lbl.set_markup(f"Last scheduled backup: <b>{icon} {t}</b> — "
+                                     f"{GLib.markup_escape_text(last.get('message', ''))}")
+        else:
+            self.last_lbl.set_text("")
 
     def refresh_disks(self):
         loc_uuid = (self.conf.get("location") or {}).get("uuid")
