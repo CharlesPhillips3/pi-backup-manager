@@ -250,6 +250,8 @@ class App(Gtk.Window):
         self.got_done = False
         self.after_job = None
         self.last_ok = False
+        self.quiet_done = False
+        self.scan_results = []
         self.conf = read_conf()
         self.backups = []
 
@@ -291,7 +293,7 @@ class App(Gtk.Window):
 
         self.action_widgets = [self.backup_btn, self.verify_btn, self.delete_btn, self.mount_btn,
                                self.files_btn, self.rebuild_btn, self.use_btn, self.format_btn,
-                               self.sched_save_btn]
+                               self.sched_save_btn, self.scan_btn]
         self.load_options_into_ui()
         self.load_schedule_into_ui()
         self.refresh()
@@ -322,9 +324,15 @@ class App(Gtk.Window):
         self.pause_lbl.set_ellipsize(Pango.EllipsizeMode.END)
         self.pause_lbl.set_hexpand(True)
         g.attach(self.pause_lbl, 1, 0, 1, 1)
+        pbox = Gtk.Box(spacing=6)
+        self.scan_btn = Gtk.Button(label="Scan…")
+        self.scan_btn.set_tooltip_text("Look at what each running service has open and suggest which to pause")
+        self.scan_btn.connect("clicked", self.on_scan_services)
         pb = Gtk.Button(label="Choose services…")
-        pb.connect("clicked", self.on_choose_services)
-        g.attach(pb, 2, 0, 1, 1)
+        pb.connect("clicked", lambda *_: self.on_choose_services())
+        pbox.pack_start(self.scan_btn, False, False, 0)
+        pbox.pack_start(pb, False, False, 0)
+        g.attach(pbox, 2, 0, 1, 1)
         g.attach(Gtk.Label(label="Skip these folders", xalign=0), 0, 1, 1, 1)
         self.excl_entry = Gtk.Entry()
         self.excl_entry.set_placeholder_text("e.g. /home/pi/Videos; /srv/cache")
@@ -389,20 +397,31 @@ class App(Gtk.Window):
             args.append("--no-exclude")
         return args
 
-    def on_choose_services(self, *_):
+    def on_scan_services(self, *_):
+        self.scan_results = []
+        self.quiet_done = True
+        self.after_job = lambda ok: ok and self.on_choose_services(scan=self.scan_results)
+        self.run_job(["scan-services"], "Scanning running services…", cancellable=False)
+
+    def on_choose_services(self, scan=None):
         svcs = running_services()
-        data = [s for s in svcs if DATA_SVC.search(s)]
-        others = [s for s in svcs if s not in data]
+        found = {r["unit"]: r for r in (scan or []) if r.get("scope") == "system"}
+        user_found = [r for r in (scan or []) if r.get("scope") == "user"]
+        named = [s for s in svcs if DATA_SVC.search(s) and s not in found]
+        others = [s for s in svcs if s not in found and s not in named]
         dlg = Gtk.Dialog(title="Pause services during backup", transient_for=self, modal=True)
         dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
-        dlg.set_default_size(460, 520)
+        dlg.set_default_size(620, 560)
         area = dlg.get_content_area()
         area.set_spacing(6)
+        area.set_border_width(8)
         intro = Gtk.Label(xalign=0)
         intro.set_line_wrap(True)
-        intro.set_markup("Services that keep databases open should be stopped for the minute or two "
-                         "the copy takes, so their data is saved in a clean state. They are restarted "
-                         "automatically afterwards.")
+        intro.set_markup("Services that keep databases or data files open should be stopped for the few "
+                         "minutes the copy takes, so their data is saved in a clean state. They are "
+                         "restarted automatically afterwards."
+                         + ("" if scan is not None else "\n<small>Tip: <b>Scan…</b> checks what each "
+                            "service actually has open and ticks the ones worth pausing.</small>"))
         area.pack_start(intro, False, False, 4)
         sw = Gtk.ScrolledWindow()
         sw.set_vexpand(True)
@@ -410,27 +429,64 @@ class App(Gtk.Window):
         sw.add(lb)
         area.pack_start(sw, True, True, 0)
         checks = {}
-        for title, group in (("Likely to hold data", data), ("Other running services", others)):
-            if not group:
-                continue
+
+        def header(text):
             h = Gtk.Label(xalign=0)
-            h.set_markup(f"<b>{title}</b>")
-            lb.pack_start(h, False, False, 4)
-            for s in group:
-                cb = Gtk.CheckButton(label=s.replace(".service", ""))
-                cb.set_active(s in self.pause_services)
-                lb.pack_start(cb, False, False, 0)
-                checks[s] = cb
-        for s in self.pause_services:  # chosen earlier but not running now
-            if s not in checks:
-                cb = Gtk.CheckButton(label=s.replace(".service", "") + " (not running now)")
-                cb.set_active(True)
-                lb.pack_start(cb, False, False, 0)
-                checks[s] = cb
+            h.set_markup(f"<b>{text}</b>")
+            lb.pack_start(h, False, False, 6)
+
+        def add(unit, active, reasons=(), recommend=False, sensitive=True, suffix=""):
+            cb = Gtk.CheckButton()
+            lab = Gtk.Label(xalign=0)
+            name = GLib.markup_escape_text(unit.replace(".service", ""))
+            tag = "  <span foreground='#26803c'><b>recommended</b></span>" if recommend else ""
+            lab.set_markup(f"{name}{suffix}{tag}")
+            cb.add(lab)
+            cb.set_active(active)
+            cb.set_sensitive(sensitive)
+            lb.pack_start(cb, False, False, 0)
+            for r in reasons:
+                rl = Gtk.Label(xalign=0)
+                rl.set_line_wrap(True)
+                rl.set_margin_start(28)
+                rl.set_markup(f"<small>{GLib.markup_escape_text(r)}</small>")
+                lb.pack_start(rl, False, False, 0)
+            if sensitive:
+                checks[unit] = cb
+
+        if scan is not None:
+            header(f"Found by scan ({len(found)})" if found else "Found by scan")
+            if not found:
+                n = Gtk.Label(xalign=0)
+                n.set_markup("<small>No system service has database or data files open right now.</small>")
+                lb.pack_start(n, False, False, 0)
+            for unit in sorted(found, key=lambda u: (not found[u]["recommend"], u)):
+                r = found[unit]
+                add(unit, unit in self.pause_services or r["recommend"], r["reasons"], r["recommend"])
+        if named:
+            header("Name suggests it holds data")
+            for unit in named:
+                add(unit, unit in self.pause_services)
+        if others:
+            header("Other running services")
+            for unit in others:
+                add(unit, unit in self.pause_services)
+        missing = [u for u in self.pause_services if u not in checks]
+        if missing:
+            header("Chosen earlier, not running now")
+            for unit in missing:
+                add(unit, True)
+        if user_found:
+            header("User services (can't be paused automatically)")
+            for r in user_found:
+                add(r["unit"], False, r["reasons"] + ["Runs in a user session; it is backed up as it is."],
+                    sensitive=False, suffix=f"  (user {r.get('user', '')})")
         dlg.show_all()
         if dlg.run() == Gtk.ResponseType.OK:
-            self.pause_services = [s for s, cb in checks.items() if cb.get_active()]
+            self.pause_services = [u for u, cb in checks.items() if cb.get_active()]
             self.update_pause_label()
+            if scan is not None:
+                self.bar.set_text("Pause list updated. Back up now or Save schedule stores it.")
         dlg.destroy()
 
     def on_add_exclude(self, *_):
@@ -1098,6 +1154,13 @@ class App(Gtk.Window):
             self.bar.set_text(text)
         elif kind == "LOG":
             self.append_log(rest)
+        elif kind == "SCAN":
+            try:
+                r = json.loads(rest)
+                self.scan_results.append(r)
+                self.append_log(f"{r['unit']}: " + "; ".join(r.get("reasons", [])))
+            except ValueError:
+                pass
         elif kind == "DONE":
             status, _, msg = rest.partition(" ")
             self.got_done = True
@@ -1106,7 +1169,8 @@ class App(Gtk.Window):
             self.bar.set_text("Finished" if self.last_ok else "Failed")
             if self.last_ok:
                 self.bar.set_fraction(1)
-            self.message(msg, error=not self.last_ok)
+            if not (self.quiet_done and self.last_ok):
+                self.message(msg, error=not self.last_ok)
         else:
             self.append_log(line)
         return False
@@ -1122,6 +1186,7 @@ class App(Gtk.Window):
         for w in self.action_widgets:
             w.set_sensitive(True)
         self.cancel_btn.set_sensitive(False)
+        self.quiet_done = False
         cb, self.after_job = self.after_job, None
         if cb:
             cb(self.last_ok)

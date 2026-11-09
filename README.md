@@ -37,7 +37,11 @@ Works with an SD card, a USB or NVMe SSD, or two NVMe drives in a RAID1 mirror.
   - *RAID1 mirror:* recreates a two-drive `mdadm` mirror with the original IDs, so the
     existing boot partition finds it unchanged.
 - **Pause services** that hold databases (MariaDB, InfluxDB, Mosquitto and so on) for the
-  few minutes the copy takes, then restart them.
+  few minutes the copy takes, then restart them. **Scan…** looks at the files each running
+  service actually has open. It recommends the ones with database files open or data files
+  being written, and shows why.
+
+  ![Service scan](screenshots/6-service-scan.png)
 - **Keep the newest N** backups. Older ones are removed automatically, and early if space
   runs short.
 
@@ -54,7 +58,7 @@ The installer doesn't touch any drive. Open **Pi Backup Manager** from the menu
 
 1. **Backup location** tab: plug in a USB drive or SSD, press *Refresh*, select it, and choose
    *Use for backups* or *Erase and make a backup drive…*.
-2. **Back up** tab: optionally choose services to pause and folders to skip, then *Back up now*.
+2. **Back up** tab: press *Scan…* to find services worth pausing, add any folders to skip, then *Back up now*.
 3. **Schedule** tab: pick when, then *Save schedule*.
 
 ## Where backups live
@@ -141,6 +145,7 @@ sudo /opt/pibackup/pibackup-helper backup --keep 5 --pause-service mariadb --exc
 sudo /opt/pibackup/pibackup-helper verify 2026-11-09_1412
 sudo /opt/pibackup/pibackup-helper restore-files 2026-11-09_1412 --dest /home/pi/Restored/x /etc/hosts
 sudo /opt/pibackup/pibackup-helper set-schedule --mode weekly --days Mon,Thu --time 02:30 --persistent --verify
+sudo /opt/pibackup/pibackup-helper scan-services
 ```
 
 ## Good to know

@@ -1168,6 +1168,127 @@ def cmd_restore_system(a):
 
 
 # ================================================================ misc
+# ================================================================ service scan
+DB_FILE = re.compile(r"(\.(db|db3|sqlite|sqlite3|ldb|mdb|rdb|aof|tsm|tsi|tsl|ibd|myd|myi|frm|realm|leveldb)$)"
+                     r"|(-wal|-shm|-journal)$|/(mysql|mariadb|postgresql|influxdb|mongodb|redis|mosquitto|"
+                     r"couchdb|elasticsearch|prometheus|grafana|homeassistant|nextcloud|docker|containerd)/", re.I)
+DATA_ROOTS = ("/home/", "/srv/", "/opt/", "/var/lib/", "/data/", "/mnt/", "/media/")
+NOISE_PATHS = ("/var/lib/systemd/", "/var/lib/NetworkManager/", "/var/lib/bluetooth/", "/var/lib/dhcp",
+               "/var/lib/polkit", "/var/lib/sudo", "/var/lib/apt/", "/var/lib/dpkg/", "/var/lib/lightdm/",
+               "/var/lib/AccountsService/", "/var/lib/upower/", "/var/lib/smartmontools/", "/var/lib/cups/",
+               "/var/lib/avahi", "/var/lib/wpa", "/var/lib/PackageKit/", "/var/lib/udisks2/", MNT + "/")
+NAME_HINT = re.compile(r"influx|maria|mysql|postgres|mongo|redis|mosquitto|elastic|prometheus|grafana|"
+                       r"home-?assistant|nextcloud|docker|containerd|couch|minio|syncthing|sqlite|database|db\b", re.I)
+PLUMBING = re.compile(r"^(systemd-|dbus|user@|getty|serial-getty|NetworkManager|wpa_supplicant|ssh|cron|avahi|"
+                      r"bluetooth|polkit|udisks2|accounts-daemon|upower|rtkit|lightdm|cups|ModemManager|packagekit|"
+                      r"rsyslog|smartmontools|triggerhappy|colord|wayvnc|rpcbind|nfs-|alsa|pipewire|wireplumber|"
+                      r"gvfs|xdg-|gnome-keyring|filter-chain|mpris|usbmuxd|mdmonitor|zram)", re.I)
+
+
+def unit_pids(unit, user=None):
+    cmd = ["systemctl"] + (["--user", "-M", f"{user}@"] if user else []) + \
+        ["show", "-p", "ControlGroup", "--value", unit]
+    cg = out(cmd).strip()
+    pids = set()
+    if not cg:
+        return pids
+    base = "/sys/fs/cgroup" + cg
+    for dirpath, _dirs, files in os.walk(base):
+        if "cgroup.procs" in files:
+            try:
+                pids.update(int(x) for x in open(os.path.join(dirpath, "cgroup.procs")).read().split())
+            except (OSError, ValueError):
+                pass
+    return pids
+
+
+def open_files(pid):
+    """Yield (path, writable) for regular files a process has open."""
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        fds = os.listdir(fd_dir)
+    except OSError:
+        return
+    for fd in fds:
+        try:
+            target = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if not target.startswith("/") or target.endswith(" (deleted)"):
+            continue
+        writable = False
+        try:
+            for line in open(f"/proc/{pid}/fdinfo/{fd}"):
+                if line.startswith("flags:"):
+                    writable = (int(line.split()[1], 8) & 3) in (1, 2)
+                    break
+        except (OSError, ValueError):
+            pass
+        yield target, writable
+
+
+def classify(unit, files):
+    """Return (recommend, reasons) for one service from its open files."""
+    name = unit.replace(".service", "")
+    db, written = set(), set()
+    for path, writable in files:
+        if path.startswith(("/proc/", "/sys/", "/dev/", "/run/", "/tmp/", "/var/log/", "/var/cache/", "/usr/",
+                            "/lib/", "/etc/", "/boot/")) or path.startswith(NOISE_PATHS):
+            continue
+        if DB_FILE.search(path):
+            db.add(path)
+        elif writable and path.startswith(DATA_ROOTS):
+            written.add(path)
+    reasons = []
+
+    def short(paths):
+        paths = sorted(paths)
+        return ", ".join(paths[:2]) + (f" (+{len(paths) - 2} more)" if len(paths) > 2 else "")
+    if db:
+        reasons.append(f"has database files open: {short(db)}")
+    if written and not PLUMBING.match(name):
+        reasons.append(f"is writing to: {short(written)}")
+    named = bool(NAME_HINT.search(name))
+    if named and not db:
+        reasons.append("its name suggests it stores data")
+    recommend = bool(db) or (bool(written) and not PLUMBING.match(name))
+    return recommend, reasons
+
+
+def cmd_scan_services(a):
+    units = [ln.split()[0] for ln in out(["systemctl", "list-units", "--type=service", "--state=running",
+                                          "--no-legend", "--plain"]).splitlines() if ln.strip()]
+    found = 0
+    progress(5, "Looking at system services")
+    for i, unit in enumerate(units):
+        files = [f for pid in unit_pids(unit) for f in open_files(pid)]
+        recommend, reasons = classify(unit, files)
+        if reasons:
+            found += 1
+            emit("SCAN", json.dumps({"unit": unit, "scope": "system", "recommend": recommend, "reasons": reasons}))
+        progress(5 + 75 * (i + 1) / max(len(units), 1), f"Checked {unit}")
+    progress(85, "Looking at user services")
+    for line in out(["loginctl", "list-users", "--no-legend"]).splitlines():
+        f = line.split()
+        if len(f) < 2 or not f[0].isdigit() or int(f[0]) < 1000:
+            continue
+        user = f[1]
+        for ln in out(["systemctl", "--user", "-M", f"{user}@", "list-units", "--type=service",
+                       "--state=running", "--no-legend", "--plain"]).splitlines():
+            if not ln.strip():
+                continue
+            unit = ln.split()[0]
+            files = [x for pid in unit_pids(unit, user) for x in open_files(pid)]
+            recommend, reasons = classify(unit, files)
+            if reasons:
+                found += 1
+                emit("SCAN", json.dumps({"unit": unit, "scope": "user", "user": user,
+                                         "recommend": recommend, "reasons": reasons}))
+    progress(100, "Scan finished")
+    done_ok(f"Scan finished: {found} service{'s' if found != 1 else ''} may hold data." if found
+            else "Scan finished: nothing running seems to keep databases or data files open.")
+
+
 def cmd_delete(a):
     ensure_mounted()
     backup_dir(a.name)
@@ -1234,6 +1355,7 @@ def main():
     sc.add_argument("--dom", type=int, default=1)
     sc.add_argument("--persistent", action="store_true")
     sc.add_argument("--verify", action="store_true")
+    sub.add_parser("scan-services")
     a = ap.parse_args()
 
     signal.signal(signal.SIGTERM, lambda *_: cancel.set())
@@ -1243,7 +1365,8 @@ def main():
         {"backup": cmd_backup, "verify": cmd_verify, "restore-files": cmd_restore_files,
          "restore-system": cmd_restore_system, "delete": cmd_delete, "mount": cmd_mount,
          "set-location": cmd_set_location, "format-location": cmd_format_location,
-         "set-options": cmd_set_options, "set-schedule": cmd_set_schedule}[a.cmd](a)
+         "set-options": cmd_set_options, "set-schedule": cmd_set_schedule,
+         "scan-services": cmd_scan_services}[a.cmd](a)
     except SystemExit:
         raise
     except Exception as e:
