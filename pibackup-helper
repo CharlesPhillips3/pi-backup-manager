@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
 FSTAB = os.environ.get("PIBACKUP_FSTAB", "/etc/fstab")
@@ -471,6 +471,57 @@ def calendar_expr(s):
     raise ValueError(s["mode"])
 
 
+EXTRA_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+
+
+def future_extras(lst):
+    """Keep valid one-time backup times ('YYYY-MM-DD HH:MM') that are still in the future, sorted."""
+    now = time.strftime("%Y-%m-%d %H:%M")
+    res = set()
+    for x in lst or []:
+        x = x.strip()
+        if not EXTRA_RE.match(x):
+            raise ValueError(f"Not a valid date and time: {x!r}")
+        try:
+            time.strptime(x, "%Y-%m-%d %H:%M")
+        except ValueError:
+            raise ValueError(f"{x[:10]} isn't a real date.")
+        if x > now:
+            res.add(x)
+    return sorted(res)
+
+
+def write_timer(c):
+    """Write the systemd timer from the saved schedule and one-time backups. Returns a status message."""
+    sched = c.get("schedule") or {"mode": "off"}
+    extras = future_extras(c.get("extra_runs"))
+    exprs = ([calendar_expr(sched)] if sched.get("mode", "off") != "off" else []) + [f"{x}:00" for x in extras]
+    tpath, spath = os.path.join(UNIT_DIR, TIMER), os.path.join(UNIT_DIR, SERVICE)
+    if not exprs:
+        run(["systemctl", "disable", "--now", TIMER], check=False)
+        return "Scheduled backups are turned off."
+    if shutil.which("systemd-analyze"):
+        for e in exprs:
+            if out(["systemd-analyze", "calendar", e]) == "":
+                raise RuntimeError(f"systemd didn't accept the time '{e}'.")
+    with open(spath, "w") as f:
+        f.write("[Unit]\nDescription=Pi Backup Manager scheduled backup\n"
+                "After=local-fs.target network-online.target\n\n"
+                "[Service]\nType=oneshot\n"
+                f"ExecStart={APP_DIR}/pibackup-helper backup --scheduled\n"
+                "Nice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=7\n")
+    with open(tpath, "w") as f:
+        f.write("[Unit]\nDescription=Pi Backup Manager schedule\n\n[Timer]\n"
+                + "".join(f"OnCalendar={e}\n" for e in exprs)
+                + f"Persistent={'true' if sched.get('persistent', True) else 'false'}\n"
+                  "AccuracySec=1min\n\n[Install]\nWantedBy=timers.target\n")
+    run(["systemctl", "daemon-reload"], check=False)
+    run(["systemctl", "enable", "--now", TIMER], check=False)
+    run(["systemctl", "restart", TIMER], check=False)
+    nxt = out(["systemctl", "show", TIMER, "-p", "NextElapseUSecRealtime", "--value"]).strip()
+    return "Schedule saved." + (f" Next backup: {nxt}." if nxt else "")
+
+
 def cmd_set_schedule(a):
     c = read_conf()
     c["options"] = options_from_args(a, c)
@@ -483,32 +534,22 @@ def cmd_set_schedule(a):
             fail("Pick at least one day of the week.")
         if a.mode == "monthly" and not 1 <= (a.dom or 0) <= 28:
             fail("Pick a day of the month from 1 to 28.")
-    sched = {"mode": a.mode, "time": a.time or "02:30", "days": (a.days or "").split(",") if a.days else [],
-             "dom": a.dom or 1, "persistent": a.persistent, "verify": a.verify}
-    c["schedule"] = sched
+    try:
+        extras = future_extras(a.extra if a.extra is not None else c.get("extra_runs"))
+    except ValueError as e:
+        fail(str(e))
+    c["schedule"] = {"mode": a.mode, "time": a.time or "02:30",
+                     "days": (a.days or "").split(",") if a.days else [],
+                     "dom": a.dom or 1, "persistent": a.persistent, "verify": a.verify}
+    c["extra_runs"] = extras
     write_conf(c)
-    tpath, spath = os.path.join(UNIT_DIR, TIMER), os.path.join(UNIT_DIR, SERVICE)
-    if a.mode == "off":
-        run(["systemctl", "disable", "--now", TIMER], check=False)
-        done_ok("Scheduled backups are turned off.")
-    expr = calendar_expr(sched)
-    if out(["systemd-analyze", "calendar", expr]) == "" and shutil.which("systemd-analyze"):
-        fail(f"systemd didn't accept the schedule '{expr}'.")
-    with open(spath, "w") as f:
-        f.write("[Unit]\nDescription=Pi Backup Manager scheduled backup\n"
-                "After=local-fs.target network-online.target\n\n"
-                "[Service]\nType=oneshot\n"
-                f"ExecStart={APP_DIR}/pibackup-helper backup --scheduled\n"
-                "Nice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=7\n")
-    with open(tpath, "w") as f:
-        f.write("[Unit]\nDescription=Pi Backup Manager schedule\n\n"
-                f"[Timer]\nOnCalendar={expr}\nPersistent={'true' if a.persistent else 'false'}\n"
-                "AccuracySec=1min\n\n[Install]\nWantedBy=timers.target\n")
-    run(["systemctl", "daemon-reload"], check=False)
-    run(["systemctl", "enable", "--now", TIMER], check=False)
-    run(["systemctl", "restart", TIMER], check=False)
-    nxt = out(["systemctl", "show", TIMER, "-p", "NextElapseUSecRealtime", "--value"]).strip()
-    done_ok("Schedule saved." + (f" Next backup: {nxt}." if nxt else ""))
+    try:
+        msg = write_timer(c)
+    except Exception as e:
+        fail(str(e))
+    if extras:
+        msg += f" One-time backups: {len(extras)}."
+    done_ok(msg)
 
 
 # ================================================================ backup
@@ -757,6 +798,19 @@ def cmd_backup(a):
     c = ensure_mounted()
     if a.scheduled:
         opts = c.get("options") or {"keep": 3, "pause_services": [], "excludes": []}
+        if c.get("extra_runs"):
+            try:
+                left = future_extras(c["extra_runs"])
+            except ValueError:
+                left = []
+            if left != c["extra_runs"]:
+                log("One-time backup started; removing it from the schedule")
+                c["extra_runs"] = left
+                write_conf(c)
+                try:
+                    write_timer(c)
+                except Exception as e:
+                    log(f"Couldn't update the timer: {e}")
     else:
         opts = options_from_args(a, c)
         if a.save_options:
@@ -1479,6 +1533,8 @@ def main():
     sc.add_argument("--dom", type=int, default=1)
     sc.add_argument("--persistent", action="store_true")
     sc.add_argument("--verify", action="store_true")
+    sc.add_argument("--extra", action="append", help="one-time backup, 'YYYY-MM-DD HH:MM' (repeatable)")
+    sc.add_argument("--no-extras", dest="extra", action="store_const", const=[])
     sub.add_parser("scan-services")
     a = ap.parse_args()
 

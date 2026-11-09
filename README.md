@@ -1,6 +1,6 @@
 # Pi Backup Manager
 
-**Version 1.3.0** · [Changelog](#changelog) · [Upgrade](#upgrade)
+**Version 1.4.0** · [Changelog](#changelog) · [Upgrade](#upgrade)
 
 A simple desktop app for **compressed, restorable whole-system backups** of a Raspberry Pi,
 with a **disk manager** for choosing where backups live and a **calendar scheduler** for
@@ -30,6 +30,11 @@ Works with an SD card, a USB or NVMe SSD, or two NVMe drives in a RAID1 mirror.
   calendar shows ✓ for backups made and • for backups coming up; click a day for details.
   Missed runs can catch up when the Pi next starts, and each scheduled backup can be checked
   automatically.
+- **One-time backups:** double-click any day on the calendar, pick a time, and that day gets an
+  extra backup (◆), on top of the regular schedule. Double-click it again to change or remove it.
+  It's saved straight away and clears itself once it has run.
+
+  ![One-time backup](screenshots/8-one-time-backup.png)
 - **Check** any backup. Every piece is read back and compared with its checksum.
 - **Browse a backup and pick what to get back:** a folder tree with checkboxes, search, sizes and
   dates. Tick a folder, untick anything inside it you don't need, then restore the selection into
@@ -206,6 +211,7 @@ Then remove the two Pi Backup Manager lines from `/etc/fstab`. Your backups stay
 
 ## Changelog
 
+- **1.4.0:** double-click a calendar day to add a one-time backup at a chosen time.
 - **1.3.0:** **Browse backup…** to look inside a backup and restore only the ticked files and
   folders; each backup saves a contents list for instant browsing.
 - **1.2.2:** a 12/24-hour clock switch in the scheduler (remembered per user).

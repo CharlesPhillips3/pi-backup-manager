@@ -17,7 +17,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
@@ -192,6 +192,7 @@ CSS = b"""
 .cal-today { border: 2px solid #3584e4; }
 .cal-backup { background-image: none; background-color: #cfeed7; color: #14361d; }
 .cal-sched { background-image: none; background-color: #d9e6fb; color: #13284d; }
+.cal-extra { background-image: none; background-color: #fde3c3; color: #5a3000; }
 .cal-selected { background-image: none; background-color: #3584e4; color: #ffffff; }
 """
 
@@ -199,10 +200,11 @@ CSS = b"""
 class MonthGrid(Gtk.Box):
     """A friendly month view: each day is a tile; ✓ = backup made, • = backup scheduled."""
 
-    def __init__(self, marks_func, on_select):
+    def __init__(self, marks_func, on_select, on_double=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.marks_func = marks_func
         self.on_select = on_select
+        self.on_double = on_double
         today = dt.date.today()
         self.year, self.month, self.selected = today.year, today.month, today
         hdr = Gtk.Box(spacing=4)
@@ -231,10 +233,18 @@ class MonthGrid(Gtk.Box):
                 b.add(lab)
                 b.get_style_context().add_class("cal-day")
                 b.connect("clicked", lambda btn: self.select(btn.day))
+                b.connect("button-press-event", self.on_press)
                 grid.attach(b, c, r + 1, 1, 1)
                 self.cells.append((b, lab))
         self.pack_start(grid, False, False, 0)
         self.redraw()
+
+    def on_press(self, btn, event):
+        if event.type == Gdk.EventType._2BUTTON_PRESS and self.on_double:
+            self.select(btn.day)
+            GLib.idle_add(lambda: (self.on_double(btn.day), False)[1])
+            return True
+        return False
 
     def shift(self, n):
         m = self.month - 1 + n
@@ -255,12 +265,12 @@ class MonthGrid(Gtk.Box):
         for i, (b, lab) in enumerate(self.cells):
             d = start + dt.timedelta(days=i)
             b.day = d
-            made, sched = self.marks_func(d)
-            sym = " ".join(x for x, on in (("✓", made), ("•", sched)) if on) or " "
+            made, sched, extra = self.marks_func(d)
+            sym = " ".join(x for x, on in (("✓", made), ("•", sched), ("◆", extra)) if on) or " "
             num = f"<b>{d.day}</b>" if made else str(d.day)
             lab.set_markup(f"{num}\n<small>{sym}</small>")
             ctx = b.get_style_context()
-            for cls in ("cal-other", "cal-today", "cal-backup", "cal-sched", "cal-selected"):
+            for cls in ("cal-other", "cal-today", "cal-backup", "cal-sched", "cal-extra", "cal-selected"):
                 ctx.remove_class(cls)
             if d.month != self.month:
                 ctx.add_class("cal-other")
@@ -270,14 +280,20 @@ class MonthGrid(Gtk.Box):
                 ctx.add_class("cal-selected")
             elif made:
                 ctx.add_class("cal-backup")
+            elif extra:
+                ctx.add_class("cal-extra")
             elif sched:
                 ctx.add_class("cal-sched")
             tip = []
             if made:
-                tip.append("Backup made")
+                tip.append("backup made")
             if sched:
-                tip.append("Backup scheduled")
-            b.set_tooltip_text(", ".join(tip) or None)
+                tip.append("backup scheduled")
+            if extra:
+                tip.append("one-time backup")
+            if d >= today and self.on_double:
+                tip.append("double-click to " + ("change the one-time backup" if extra else "add a one-time backup"))
+            b.set_tooltip_text(", ".join(tip).capitalize() if tip else None)
 
 
 class BackupExplorer(Gtk.Dialog):
@@ -509,6 +525,7 @@ class App(Gtk.Window):
         self.quiet_done = False
         self.scan_results = []
         self.index_path = None
+        self.extras = []
         self.prefs = load_prefs()
         self.use24 = bool(self.prefs.get("clock24", False))
         self.conf = read_conf()
@@ -769,12 +786,13 @@ class App(Gtk.Window):
     def build_schedule_tab(self):
         outer = Gtk.Box(spacing=16, border_width=8)
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.cal = MonthGrid(self.day_marks, self.show_day)
+        self.cal = MonthGrid(self.day_marks, self.show_day, self.on_day_double)
         left.pack_start(self.cal, False, False, 0)
         legend = Gtk.Label(xalign=0)
-        legend.set_markup("<small><span background='#cfeed7' foreground='#14361d'> ✓ backup made </span>   "
-                          "<span background='#d9e6fb' foreground='#13284d'> • backup scheduled </span>   "
-                          "click a day for details</small>")
+        legend.set_markup("<small><span background='#cfeed7' foreground='#14361d'> ✓ backup made </span>  "
+                          "<span background='#d9e6fb' foreground='#13284d'> • scheduled </span>  "
+                          "<span background='#fde3c3' foreground='#5a3000'> ◆ one-time </span>\n"
+                          "Click a day for details · <b>double-click</b> a day to add a one-time backup</small>")
         left.pack_start(legend, False, False, 0)
         self.day_info = Gtk.Label(xalign=0, yalign=0)
         self.day_info.set_line_wrap(True)
@@ -836,8 +854,8 @@ class App(Gtk.Window):
         self.time_box.pack_start(self.clock24_cb, False, False, 8)
         self.fill_hours()
         self.time_hint = Gtk.Label(xalign=0)
-        self.time_box.pack_start(self.time_hint, False, False, 8)
         right.pack_start(self.time_box, False, False, 0)
+        right.pack_start(self.time_hint, False, False, 0)
 
         self.persist_cb = Gtk.CheckButton(label="If the Pi was off at that time, back up when it next starts")
         self.verify_cb = Gtk.CheckButton(label="Check each backup after it's made (takes a few extra minutes)")
@@ -866,6 +884,8 @@ class App(Gtk.Window):
         return outer
 
     def load_schedule_into_ui(self):
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.extras = sorted(x for x in (self.conf.get("extra_runs") or []) if x > now)
         s = self.conf.get("schedule") or {"mode": "off", "time": "02:30", "days": ["Sun"], "dom": 1,
                                           "persistent": True, "verify": False}
         self._loading = True
@@ -943,10 +963,10 @@ class App(Gtk.Window):
         for w in (self.persist_cb, self.verify_cb):
             w.set_sensitive(mode != "off")
         hh = int(s["time"][:2])
-        self.time_hint.set_markup("<small>(night-time is best: the Pi is usually idle)</small>"
-                                  if 1 <= hh <= 5 else "")
-        runs = next_runs(s)
-        if mode == "off":
+        self.time_hint.set_markup("<small>Night-time is a good choice: the Pi is usually idle.</small>"
+                                  if 1 <= hh <= 5 and mode != "off" else "")
+        runs = sorted(next_runs(s) + [dt.datetime.strptime(x, "%Y-%m-%d %H:%M") for x in self.extras])[:3]
+        if mode == "off" and not runs:
             self.next_lbl.set_markup("Automatic backups are <b>off</b>.")
         elif not runs:
             self.next_lbl.set_markup("<b>Pick at least one day.</b>")
@@ -975,10 +995,14 @@ class App(Gtk.Window):
         hh, mm = (int(x) for x in s["time"].split(":"))
         return dt.datetime.combine(day, dt.time(hh, mm)) > dt.datetime.now()
 
+    def extras_on(self, day):
+        key = day.strftime("%Y-%m-%d")
+        return [x for x in self.extras if x.startswith(key)]
+
     def day_marks(self, day):
         if not hasattr(self, "mode_combo"):
-            return False, False
-        return bool(self.backups_on(day)), self.scheduled_on(day)
+            return False, False, False
+        return bool(self.backups_on(day)), self.scheduled_on(day), bool(self.extras_on(day))
 
     def show_day(self, d):
         lines = [f"<b>{d.strftime('%A %d %B %Y')}</b>"]
@@ -988,8 +1012,11 @@ class App(Gtk.Window):
                          f"{' (scheduled)' if b.get('scheduled') else ''}, checked: {chk}")
         if self.scheduled_on(d):
             lines.append(f"• Backup scheduled at {self.fmt_time(self.ui_schedule()['time'])}")
+        for x in self.extras_on(d):
+            lines.append(f"◆ One-time backup at {self.fmt_time(x[11:])} (double-click the day to change it)")
         if len(lines) == 1:
-            lines.append("Nothing on this day.")
+            lines.append("Nothing on this day." + ("  Double-click it to add a one-time backup."
+                                                   if d >= dt.date.today() else ""))
         self.day_info.set_markup("\n".join(lines))
 
     def on_save_schedule(self, *_):
@@ -1006,7 +1033,109 @@ class App(Gtk.Window):
             args.append("--persistent")
         if self.verify_cb.get_active():
             args.append("--verify")
+        args += self.extra_args()
         self.run_job(args, "Saving schedule…")
+
+    def extra_args(self):
+        if not self.extras:
+            return ["--no-extras"]
+        res = []
+        for x in self.extras:
+            res += ["--extra", x]
+        return res
+
+    def on_day_double(self, day):
+        if self.proc:
+            return
+        if day < dt.date.today():
+            self.message("That day has already passed. Pick today or a later day for a one-time backup.")
+            return
+        existing = self.extras_on(day)
+        dlg = Gtk.Dialog(title="One-time backup", transient_for=self, modal=True)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        if existing:
+            dlg.add_button("Remove", 1)
+        okb = dlg.add_button("Change" if existing else "Add backup", Gtk.ResponseType.OK)
+        okb.get_style_context().add_class("suggested-action")
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(12)
+        head = Gtk.Label(xalign=0)
+        head.set_markup(f"<big><b>Back up once on {day.strftime('%A %d %B %Y')}</b></big>")
+        area.pack_start(head, False, False, 0)
+        row = Gtk.Box(spacing=4)
+        row.pack_start(Gtk.Label(label="at"), False, False, 0)
+        hc, mc, ac = Gtk.ComboBoxText(), Gtk.ComboBoxText(), Gtk.ComboBoxText()
+        if self.use24:
+            for h in range(24):
+                hc.append(f"{h:02d}", f"{h:02d}")
+        else:
+            for h in range(1, 13):
+                hc.append(str(h), str(h))
+            for x in ("AM", "PM"):
+                ac.append(x, x)
+        for mm in ("00", "15", "30", "45"):
+            mc.append(mm, mm)
+        if existing:
+            h24, mm = int(existing[0][11:13]), existing[0][14:16]
+        elif day == dt.date.today():
+            nxt = dt.datetime.now() + dt.timedelta(minutes=20)
+            h24, mm = nxt.hour, f"{(nxt.minute // 15) * 15:02d}"
+        else:
+            h24, m2 = (int(x) for x in self.ui_schedule()["time"].split(":"))
+            mm = f"{m2:02d}" if f"{m2:02d}" in ("00", "15", "30", "45") else "30"
+        if self.use24:
+            hc.set_active_id(f"{h24:02d}")
+        else:
+            hc.set_active_id(str(h24 % 12 or 12))
+            ac.set_active_id("AM" if h24 < 12 else "PM")
+        mc.set_active_id(mm if mm in ("00", "15", "30", "45") else "00")
+        row.pack_start(hc, False, False, 0)
+        row.pack_start(Gtk.Label(label=":"), False, False, 0)
+        row.pack_start(mc, False, False, 0)
+        if not self.use24:
+            row.pack_start(ac, False, False, 4)
+        area.pack_start(row, False, False, 0)
+        note = Gtk.Label(xalign=0)
+        note.set_line_wrap(True)
+        note.set_max_width_chars(52)
+        note.set_markup("<small>This is in addition to your regular schedule and uses the same settings. "
+                        "It's saved straight away, and removed by itself once it has run.</small>")
+        area.pack_start(note, False, False, 0)
+        dlg.show_all()
+        resp = dlg.run()
+        hid, mid, aid = hc.get_active_id(), mc.get_active_id(), ac.get_active_id()
+        dlg.destroy()
+        if resp not in (Gtk.ResponseType.OK, 1):
+            return
+        before = list(self.extras)
+        for x in existing:
+            self.extras.remove(x)
+        if resp == Gtk.ResponseType.OK:
+            h = int(hid) if self.use24 else (int(hid) % 12) + (12 if aid == "PM" else 0)
+            when = f"{day.strftime('%Y-%m-%d')} {h:02d}:{mid}"
+            if when <= dt.datetime.now().strftime("%Y-%m-%d %H:%M"):
+                self.extras = before
+                self.message("That time has already passed today. Pick a later time.", error=True)
+                return
+            self.extras = sorted(set(self.extras + [when]))
+        self.save_extras()
+
+    def save_extras(self):
+        """Save one-time backups now, keeping the regular schedule exactly as it was last saved."""
+        saved = self.conf.get("schedule") or {"mode": "off", "time": "02:30", "days": [], "dom": 1,
+                                             "persistent": True, "verify": False}
+        args = ["set-schedule", "--mode", saved.get("mode", "off"), "--time", saved.get("time", "02:30"),
+                "--days", ",".join(saved.get("days") or []), "--dom", str(saved.get("dom", 1))]
+        if saved.get("persistent", True):
+            args.append("--persistent")
+        if saved.get("verify"):
+            args.append("--verify")
+        args += self.extra_args()
+        self.mark_calendar()
+        self.on_schedule_changed()
+        self.run_job(args, "Saving one-time backup…")
+
 
     # ============================================================ Restore tab
     def build_restore_tab(self):
