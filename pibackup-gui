@@ -14,6 +14,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
+VERSION = "1.2.0"
 HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
@@ -243,7 +244,7 @@ class MonthGrid(Gtk.Box):
 # ---------------------------------------------------------------- window
 class App(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Pi Backup Manager")
+        super().__init__(title=f"Pi Backup Manager {VERSION}")
         self.set_default_size(940, 700)
         self.set_border_width(10)
         self.proc = None
@@ -264,6 +265,11 @@ class App(Gtk.Window):
         self.mount_btn = Gtk.Button(label="Connect backup drive")
         self.mount_btn.connect("clicked", lambda *_: self.run_job(["mount"], "Mounting…"))
         top.pack_start(self.mount_btn, False, False, 0)
+        ver = Gtk.Label()
+        ver.set_markup(f"<small><span foreground='#888888'>version {VERSION}</span></small>")
+        ver.set_tooltip_text("Upgrade: curl -fsSL https://raw.githubusercontent.com/CharlesPhillips3/"
+                             "pi-backup-manager/main/upgrade.sh | sudo bash")
+        top.pack_end(ver, False, False, 0)
         root.pack_start(top, False, False, 0)
 
         self.nb = Gtk.Notebook()

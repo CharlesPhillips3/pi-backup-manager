@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 
+VERSION = "1.2.0"
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
 FSTAB = os.environ.get("PIBACKUP_FSTAB", "/etc/fstab")
@@ -689,6 +690,7 @@ def collect_info(work, name, a, opts):
         "hostname": os.uname().nodename,
         "kernel": os.uname().release,
         "model": cat("/proc/device-tree/model").strip("\x00\n"),
+        "app_version": VERSION,
         "options": opts,
         "root": {"source": root_src, "uuid": blk(root_src, "UUID"), "label": blk(root_src, "LABEL"),
                  "partuuid": blk(root_src, "PARTUUID"),
@@ -1311,6 +1313,9 @@ def add_option_args(p):
 
 
 def main():
+    if "--version" in sys.argv[1:2]:
+        print(f"Pi Backup Manager {VERSION}")
+        return
     if os.geteuid() != 0:
         fail("This helper must run as root.")
     ap = argparse.ArgumentParser(prog="pibackup-helper")

@@ -1,5 +1,7 @@
 # Pi Backup Manager
 
+**Version 1.2.0** · [Changelog](#changelog) · [Upgrade](#upgrade)
+
 A simple desktop app for **compressed, restorable whole-system backups** of a Raspberry Pi,
 with a **disk manager** for choosing where backups live and a **calendar scheduler** for
 automatic backups.
@@ -53,6 +55,12 @@ cd pi-backup-manager
 sudo bash install.sh
 ```
 
+Or install it in one line, without keeping a copy of the repo:
+
+```
+curl -fsSL https://raw.githubusercontent.com/CharlesPhillips3/pi-backup-manager/main/upgrade.sh | sudo bash
+```
+
 The installer doesn't touch any drive. Open **Pi Backup Manager** from the menu
 (System Tools), or run `pibackup`. Then:
 
@@ -60,6 +68,19 @@ The installer doesn't touch any drive. Open **Pi Backup Manager** from the menu
    *Use for backups* or *Erase and make a backup drive…*.
 2. **Back up** tab: press *Scan…* to find services worth pausing, add any folders to skip, then *Back up now*.
 3. **Schedule** tab: pick when, then *Save schedule*.
+
+## Upgrade
+
+Run the same line again. It fetches the latest version and reinstalls it; your settings,
+schedule and backups are kept:
+
+```
+curl -fsSL https://raw.githubusercontent.com/CharlesPhillips3/pi-backup-manager/main/upgrade.sh | sudo bash
+```
+
+If you installed from a clone instead: `cd pi-backup-manager && git pull && sudo bash install.sh`.
+The version you have is shown at the top right of the app, and by
+`/opt/pibackup/pibackup-helper --version`.
 
 ## Where backups live
 
@@ -167,6 +188,16 @@ sudo rm -rf /opt/pibackup /usr/local/bin/pibackup /usr/share/applications/piback
   /etc/pibackup.conf /var/lib/pibackup
 ```
 Then remove the two Pi Backup Manager lines from `/etc/fstab`. Your backups stay on the drive.
+
+## Changelog
+
+- **1.2.0:** the version is shown in the app; one-line install and upgrade (`upgrade.sh`).
+- **1.1.1:** Backup location: selecting a drive uses its only usable partition, and greyed-out
+  buttons explain why.
+- **1.1.0:** **Scan…** finds services worth pausing during a backup.
+- **1.0.1:** reads older single-file backups (`root.tar.zst`) as well as split ones.
+- **1.0.0:** first release: backups, disk manager, calendar scheduler, file restore, and
+  rebuilding onto a single drive or a RAID1 mirror.
 
 ## License
 

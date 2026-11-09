@@ -15,7 +15,8 @@ apt-get install -y exfatprogs mdadm >/dev/null 2>&1 || true   # optional: exFAT 
 
 echo "== Installing to /opt/pibackup"
 install -d /opt/pibackup
-install -m 755 "$HERE/pibackup-helper" "$HERE/pibackup-gui" "$HERE/install.sh" /opt/pibackup/
+install -m 755 "$HERE/pibackup-helper" "$HERE/pibackup-gui" "$HERE/install.sh" "$HERE/upgrade.sh" /opt/pibackup/
+install -m 644 "$HERE/VERSION" /opt/pibackup/
 install -m 644 "$HERE/README.md" /opt/pibackup/
 ln -sf /opt/pibackup/pibackup-gui /usr/local/bin/pibackup
 
