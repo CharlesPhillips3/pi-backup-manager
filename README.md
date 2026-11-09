@@ -1,6 +1,6 @@
 # Pi Backup Manager
 
-**Version 1.2.0** · [Changelog](#changelog) · [Upgrade](#upgrade)
+**Version 1.2.1** · [Changelog](#changelog) · [Upgrade](#upgrade)
 
 A simple desktop app for **compressed, restorable whole-system backups** of a Raspberry Pi,
 with a **disk manager** for choosing where backups live and a **calendar scheduler** for
@@ -191,6 +191,7 @@ Then remove the two Pi Backup Manager lines from `/etc/fstab`. Your backups stay
 
 ## Changelog
 
+- **1.2.1:** the scheduler uses a 12-hour clock with AM/PM.
 - **1.2.0:** the version is shown in the app; one-line install and upgrade (`upgrade.sh`).
 - **1.1.1:** Backup location: selecting a drive uses its only usable partition, and greyed-out
   buttons explain why.

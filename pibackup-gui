@@ -14,7 +14,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 HELPER = os.environ.get("PIBACKUP_HELPER", "/opt/pibackup/pibackup-helper")
 MNT = os.environ.get("PIBACKUP_MNT", "/mnt/pibackup")
 CONF = os.environ.get("PIBACKUP_CONF", "/etc/pibackup.conf")
@@ -116,6 +116,12 @@ def mounts_of(n):
 
 def backup_size(m):
     return sum(f.get("bytes", 0) for f in m.get("files", {}).values())
+
+
+def fmt12(hhmm):
+    """'02:30' -> '2:30 AM', '14:05' -> '2:05 PM'."""
+    hh, mm = (int(x) for x in hhmm.split(":"))
+    return f"{hh % 12 or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
 
 
 def schedule_matches(s, day):
@@ -559,16 +565,20 @@ class App(Gtk.Window):
         self.time_box = Gtk.Box(spacing=4)
         self.time_box.pack_start(Gtk.Label(label="at"), False, False, 0)
         self.hour_combo = Gtk.ComboBoxText()
-        for hh in range(24):
-            self.hour_combo.append(f"{hh:02d}", f"{hh:02d}")
+        for h in range(1, 13):
+            self.hour_combo.append(str(h), str(h))
         self.min_combo = Gtk.ComboBoxText()
         for mm in ("00", "15", "30", "45"):
             self.min_combo.append(mm, mm)
-        self.hour_combo.connect("changed", self.on_schedule_changed)
-        self.min_combo.connect("changed", self.on_schedule_changed)
+        self.ampm_combo = Gtk.ComboBoxText()
+        for x in ("AM", "PM"):
+            self.ampm_combo.append(x, x)
+        for w in (self.hour_combo, self.min_combo, self.ampm_combo):
+            w.connect("changed", self.on_schedule_changed)
         self.time_box.pack_start(self.hour_combo, False, False, 0)
         self.time_box.pack_start(Gtk.Label(label=":"), False, False, 0)
         self.time_box.pack_start(self.min_combo, False, False, 0)
+        self.time_box.pack_start(self.ampm_combo, False, False, 4)
         self.time_hint = Gtk.Label(xalign=0)
         self.time_box.pack_start(self.time_hint, False, False, 8)
         right.pack_start(self.time_box, False, False, 0)
@@ -605,7 +615,9 @@ class App(Gtk.Window):
         self._loading = True
         self.mode_combo.set_active_id(s.get("mode", "off"))
         hh, mm = s.get("time", "02:30").split(":")
-        self.hour_combo.set_active_id(f"{int(hh):02d}")
+        h24 = int(hh)
+        self.hour_combo.set_active_id(str(h24 % 12 or 12))
+        self.ampm_combo.set_active_id("AM" if h24 < 12 else "PM")
         self.min_combo.set_active_id(mm if mm in ("00", "15", "30", "45") else "30")
         for d, t in self.day_toggles.items():
             t.set_active(d in (s.get("days") or ["Sun"]))
@@ -615,9 +627,15 @@ class App(Gtk.Window):
         self._loading = False
         self.on_schedule_changed()
 
+    def ui_time24(self):
+        h12 = int(self.hour_combo.get_active_id() or 2)
+        pm = (self.ampm_combo.get_active_id() or "AM") == "PM"
+        h24 = (h12 % 12) + (12 if pm else 0)
+        return f"{h24:02d}:{self.min_combo.get_active_id() or '30'}"
+
     def ui_schedule(self):
         return {"mode": self.mode_combo.get_active_id() or "off",
-                "time": f"{self.hour_combo.get_active_id() or '02'}:{self.min_combo.get_active_id() or '30'}",
+                "time": self.ui_time24(),
                 "days": [d for d, t in self.day_toggles.items() if t.get_active()],
                 "dom": int(self.dom_spin.get_value())}
 
@@ -641,7 +659,7 @@ class App(Gtk.Window):
             self.next_lbl.set_markup("<b>Pick at least one day.</b>")
         else:
             self.next_lbl.set_markup("Next backups: <b>" + "</b>, <b>".join(
-                r.strftime("%a %d %b %H:%M") for r in runs) + "</b>")
+                f"{r.strftime('%a %d %b')} {fmt12(r.strftime('%H:%M'))}" for r in runs) + "</b>")
         saved = self.conf.get("schedule") or {"mode": "off"}
         changed = any(saved.get(k) != s[k] for k in ("mode", "time", "dom")) or \
             (mode == "weekly" and saved.get("days") != s["days"])
@@ -673,10 +691,10 @@ class App(Gtk.Window):
         lines = [f"<b>{d.strftime('%A %d %B %Y')}</b>"]
         for b in self.backups_on(d):
             chk = b.get("verified", "not checked yet")
-            lines.append(f"✓ Backup at {b['name'][11:13]}:{b['name'][13:]} — {gb(backup_size(b))}"
+            lines.append(f"✓ Backup at {fmt12(b['name'][11:13] + ':' + b['name'][13:])} — {gb(backup_size(b))}"
                          f"{' (scheduled)' if b.get('scheduled') else ''}, checked: {chk}")
         if self.scheduled_on(d):
-            lines.append(f"• Backup scheduled at {self.ui_schedule()['time']}")
+            lines.append(f"• Backup scheduled at {fmt12(self.ui_schedule()['time'])}")
         if len(lines) == 1:
             lines.append("Nothing on this day.")
         self.day_info.set_markup("\n".join(lines))
@@ -1042,7 +1060,10 @@ class App(Gtk.Window):
         last = last_scheduled()
         if last:
             icon = "✓" if last.get("ok") else "✗"
-            self.last_lbl.set_markup(f"Last scheduled backup: <b>{icon} {last.get('time', '')}</b> — "
+            t = last.get("time", "")
+            if re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d$", t):
+                t = dt.datetime.strptime(t, "%Y-%m-%d %H:%M").strftime("%a %d %b ") + fmt12(t[11:])
+            self.last_lbl.set_markup(f"Last scheduled backup: <b>{icon} {t}</b> — "
                                      f"{GLib.markup_escape_text(last.get('message', ''))}")
         else:
             self.last_lbl.set_text("")
